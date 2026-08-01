@@ -1,0 +1,476 @@
+;; pco.repl — PCO community governance token (module `pco`) test suite.
+;;
+;; Self-contained: interfaces from tests/fixtures. Covers the fungible core
+;; (one-shot hub mint under the 2-of-3 community keyset, reserved-name
+;; protocol, managed transfers), the advisory governance delta (threshold,
+;; live-vote weight, re-vote, release on transfer/cross-chain debit,
+;; hub-chain gating, reserve exclusion, tally freeze), keyset-governed
+;; upgrade + rotation, and the cross-chain step-0 debit semantics.
+;;
+;; REPL discipline: expect-failure does NOT roll back a failed action's
+;; partial writes, and commit-tx would persist the leak - every negative
+;; case that could write lives in its own transaction ended by rollback-tx.
+;; This suite proves step 0 (debit + vote release + yield). The step-1 RESUME
+;; is covered in xchain.repl - and note that it IS reachable in the REPL via
+;; `continue-pact`, contrary to what this header used to say. Believing the
+;; resume was devnet-only left its guard check untested, and a mutation audit
+;; later showed a squatted receiver could take the sender's tokens.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+;; ---------------------------------------------------------------------------
+;; Setup: interfaces + namespace + community keyset + deploy
+;; ---------------------------------------------------------------------------
+(begin-tx "interfaces + coin (pco references coin.VALID_CHAIN_IDS)")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "namespace + keyset + deploy")
+(env-data
+  { "ns": "free"
+  , "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "pco-ops": { "keys": ["ledger-a"], "pred": "keys-all" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(commit-tx)
+(begin-tx "governance names the ops authority (replaces the old pco-ops keyset)")
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco.set-ops-guard (read-keyset 'pco-ops))
+(commit-tx)
+
+
+;; deploy-state sanity
+(expect "supply row seeded, nothing minted" 0.0 (free.pco.chain-minted))
+(expect "reserve account derives from the keyset reference"
+  "r:free.pco-gov" (free.pco.reserve-account))
+(expect "no burn path, RCV governance: reserve view answers" "r:free.pco-gov" (free.pco.reserve-account))
+
+;; ---------------------------------------------------------------------------
+;; One-shot mint: keyset gate (2-of-3), hub-chain gate, exactness
+;; ---------------------------------------------------------------------------
+(env-data
+  { "whale":  { "keys": ["whale-key"],  "pred": "keys-all" }
+  , "holder": { "keys": ["holder-key"], "pred": "keys-all" }
+  , "carol":  { "keys": ["carol-key"],  "pred": "keys-all" }
+  , "attacker": { "keys": ["attacker-key"], "pred": "keys-all" } })
+
+(begin-tx "mint requires the community keyset")
+(env-keys ["attacker-key"])
+(expect-failure "non-admin cannot mint" "Keyset failure"
+  (free.pco.init-mint
+    [ { "account": "whale", "guard": (read-keyset 'whale), "amount": 1000000.0 } ]))
+(rollback-tx)
+
+(begin-tx "mint requires TWO of the three keys")
+(env-keys ["ledger-a"])
+(expect-failure "1-of-3 is not enough" "Keyset failure"
+  (free.pco.init-mint
+    [ { "account": "whale", "guard": (read-keyset 'whale), "amount": 1000000.0 } ]))
+(rollback-tx)
+
+(begin-tx "mint is hub-chain only")
+(env-chain-data { "chain-id": "7" })
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "no mint off the hub" "hub chain only"
+  (free.pco.init-mint
+    [ { "account": "whale", "guard": (read-keyset 'whale), "amount": 1000000.0 } ]))
+(rollback-tx)
+(env-chain-data { "chain-id": "0" })
+
+(begin-tx "distribution must be exact")
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "under-distribution rejected" "exactly TOTAL-SUPPLY"
+  (free.pco.init-mint
+    [ { "account": "whale", "guard": (read-keyset 'whale), "amount": 999999.0 } ]))
+(rollback-tx)
+
+(begin-tx "the one mint")
+(env-keys ["ledger-b", "ledger-c"])
+(expect "mint succeeds with a different 2-of-3 pair" "minted"
+  (free.pco.init-mint
+    [ { "account": "whale",  "guard": (read-keyset 'whale),  "amount": 500000.0 }
+    , { "account": "holder", "guard": (read-keyset 'holder), "amount": 1500.0 }
+    , { "account": "carol",  "guard": (read-keyset 'carol),  "amount": 398500.0 }
+    , { "account": "r:free.pco-gov", "guard": (keyset-ref-guard "free.pco-gov"), "amount": 100000.0 } ]))
+(commit-tx)
+
+(expect "whale funded" 500000.0 (free.pco.get-balance "whale"))
+(expect "reserve funded" 100000.0 (free.pco.get-balance "r:free.pco-gov"))
+(expect "chain-minted = total supply on the hub" 1000000.0 (free.pco.chain-minted))
+
+(begin-tx "second mint impossible")
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "one-shot" "already minted"
+  (free.pco.init-mint
+    [ { "account": "whale", "guard": (read-keyset 'whale), "amount": 1000000.0 } ]))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; Reserved-name protocol + managed transfer basics
+;; ---------------------------------------------------------------------------
+(begin-tx "k: squatting rejected")
+(env-data { "attacker": { "keys": ["attacker-key"], "pred": "keys-all" } })
+(expect-failure "k: account must be principal of its guard"
+  "Single-key account protocol violation"
+  (free.pco.create-account
+    "k:f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0"
+    (read-keyset 'attacker)))
+(rollback-tx)
+
+(begin-tx "transfer under a scoped signature")
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER "whale" "holder" 100.0)] } ])
+(free.pco.transfer "whale" "holder" 100.0)
+(expect "holder credited" 1600.0 (free.pco.get-balance "holder"))
+(commit-tx)
+
+(begin-tx "transfer beyond managed amount rejected")
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER "whale" "holder" 100.0)] } ])
+(free.pco.transfer "whale" "holder" 60.0)
+(expect-failure "second leg exceeds the managed budget" "TRANSFER exceeded"
+  (free.pco.transfer "whale" "holder" 60.0))
+(rollback-tx)
+
+(begin-tx "foreign key cannot debit")
+(env-sigs [ { "key": "attacker-key"
+            , "caps": [(free.pco.TRANSFER "whale" "holder" 100.0)] } ])
+(expect-failure "sender guard enforced" "Keyset failure"
+  (free.pco.transfer "whale" "holder" 100.0))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; Advisory governance: ADMIN-authored ranked-choice questions, live Borda
+;; scores. K=3 options here: rank position p contributes weight*(3-p) points.
+;; ---------------------------------------------------------------------------
+(begin-tx "the community cannot put proposals on-chain (admin-authored)")
+(env-sigs [ { "key": "whale-key", "caps": [] } ])
+(expect-failure "holders suggest on the public channels; the org proposes"
+  "governance or ops authority required"
+  (free.pco.create-proposal "t" "b" ["a" "b"] 72))
+(rollback-tx)
+
+(begin-tx "governance is hub-chain only")
+(env-chain-data { "chain-id": "3" })
+(env-keys ["ledger-a"])
+(expect-failure "no proposals off the hub" "hub chain only"
+  (free.pco.create-proposal "off-hub" "body" ["a" "b"] 72))
+(rollback-tx)
+(env-chain-data { "chain-id": "0" })
+
+(begin-tx "proposal opens under the OPS key alone (routine tier)")
+(env-keys ["ledger-a"])
+(expect "pid 1" "1" (free.pco.create-proposal
+  "Which template family should the catalog grow next?"
+  "Advisory: rank the options."
+  ["catalog-v2" "docs" "oracles"] 168))
+(commit-tx)
+
+(begin-tx "reserve cannot vote")
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "reserve exclusion" "reserve cannot vote"
+  (free.pco.cast-vote "1" "r:free.pco-gov" [0]))
+(rollback-tx)
+
+;; --- V-ESCROW: escrows outside the float do not vote -------------------------
+;; The rule is a REGISTER OF NAMED ACCOUNTS, not a rule about guard types. What
+;; disqualifies an account is what it HOLDS - undistributed community tokens -
+;; so these cases prove the register decides, and that an identical account that
+;; is NOT registered keeps its vote. A type-based rule would have failed the
+;; second half by disenfranchising a legitimate contract-held position.
+(begin-tx "V-ESCROW: a registered escrow cannot vote")
+(env-data { "ug": { "keys": ["holder-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "holder-key"
+            , "caps": [(free.pco.TRANSFER "holder"
+                        (create-principal (create-user-guard (free.pco.precision))) 500.0)] } ])
+(free.pco.transfer-create "holder"
+  (create-principal (create-user-guard (free.pco.precision)))
+  (create-user-guard (free.pco.precision)) 500.0)
+(expect "the escrow really does hold PCO" 500.0
+  (free.pco.get-balance (create-principal (create-user-guard (free.pco.precision)))))
+;; unregistered, it votes like any other holder - the register is the rule
+(env-sigs [ { "key": "holder-key"
+            , "caps": [(free.pco.VOTE "1" (create-principal (create-user-guard (free.pco.precision))))] } ])
+(expect "an UNREGISTERED contract-held account still votes" "vote recorded"
+  (free.pco.cast-vote "1" (create-principal (create-user-guard (free.pco.precision))) [0]))
+(rollback-tx)
+
+(begin-tx "V-ESCROW: once registered, the same account is refused")
+(env-data { "ug": { "keys": ["holder-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "holder-key"
+            , "caps": [(free.pco.TRANSFER "holder"
+                        (create-principal (create-user-guard (free.pco.precision))) 500.0)] } ])
+(free.pco.transfer-create "holder"
+  (create-principal (create-user-guard (free.pco.precision)))
+  (create-user-guard (free.pco.precision)) 500.0)
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "a reason is mandatory - the register is meant to be read"
+  "a public reason is required"
+  (free.pco.register-non-voting
+    (create-principal (create-user-guard (free.pco.precision))) ""))
+(free.pco.register-non-voting
+  (create-principal (create-user-guard (free.pco.precision))) "test escrow")
+(expect "the register is publicly readable" "test escrow"
+  (free.pco.non-voting-reason (create-principal (create-user-guard (free.pco.precision)))))
+(env-sigs [ { "key": "holder-key"
+            , "caps": [(free.pco.VOTE "1" (create-principal (create-user-guard (free.pco.precision))))] } ])
+(expect-failure "a registered escrow is refused"
+  "registered as non-voting"
+  (free.pco.cast-vote "1" (create-principal (create-user-guard (free.pco.precision))) [0]))
+;; and the correction path works, so an account excluded in error is not
+;; silently disenfranchised forever
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco.release-non-voting (create-principal (create-user-guard (free.pco.precision))))
+(env-sigs [ { "key": "holder-key"
+            , "caps": [(free.pco.VOTE "1" (create-principal (create-user-guard (free.pco.precision))))] } ])
+(expect "released, it votes again" "vote recorded"
+  (free.pco.cast-vote "1" (create-principal (create-user-guard (free.pco.precision))) [0]))
+(rollback-tx)
+
+(begin-tx "V-ESCROW: only governance may change the register")
+(env-keys ["attacker-key"])
+(expect-failure "a stranger cannot register an account" "Keyset failure"
+  (free.pco.register-non-voting "holder" "malicious exclusion"))
+(expect-failure "a stranger cannot release one" "Keyset failure"
+  (free.pco.release-non-voting "holder"))
+(rollback-tx)
+
+(begin-tx "V-ESCROW: ordinary accounts are unaffected")
+(env-sigs [ { "key": "holder-key", "caps": [(free.pco.VOTE "1" "holder")] } ])
+(expect "a plain named account votes" "vote recorded"
+  (free.pco.cast-vote "1" "holder" [0]))
+(rollback-tx)
+
+(begin-tx "ballots: live weight, Borda scores, re-vote in place")
+;; whale (499,900) ranks only option 0: +3w to option 0
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE "1" "whale")] } ])
+(free.pco.cast-vote "1" "whale" [0])
+;; holder (1,600) ranks [1,0]: +3w to option 1, +2w to option 0
+(env-sigs [ { "key": "holder-key", "caps": [(free.pco.VOTE "1" "holder")] } ])
+(free.pco.cast-vote "1" "holder" [1 0])
+(let ((r (free.pco.get-results "1")))
+  (expect "scores after two ballots"
+    [1502900.0 4800.0 0.0] (at 'scores r))
+  (expect "turnout = sum of ballot weights" 501500.0 (at 'turnout r)))
+;; re-vote REPLACES the ballot: holder switches to [2] only
+(env-sigs [ { "key": "holder-key", "caps": [(free.pco.VOTE "1" "holder")] } ])
+(free.pco.cast-vote "1" "holder" [2])
+(let ((r (free.pco.get-results "1")))
+  (expect "old contribution fully removed, new applied"
+    [1499700.0 0.0 4800.0] (at 'scores r))
+  (expect "turnout unchanged by a re-vote" 501500.0 (at 'turnout r)))
+(commit-tx)
+
+(begin-tx "transfer releases the moved weight (vote-then-transfer closed)")
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER "whale" "carol" 200000.0)] } ])
+(free.pco.transfer "whale" "carol" 200000.0)
+(let ((r (free.pco.get-results "1")))
+  ;; whale's ballot [0] shrank by 200,000 weight -> -600,000 points on opt 0
+  (expect "excess Borda points left with the tokens"
+    [899700.0 0.0 4800.0] (at 'scores r))
+  (expect "turnout shrank by the moved weight" 301500.0 (at 'turnout r)))
+;; received tokens arrive unvoted: carol (598,500) then ranks [0]
+(env-sigs [ { "key": "carol-key", "caps": [(free.pco.VOTE "1" "carol")] } ])
+(free.pco.cast-vote "1" "carol" [0])
+(let ((r (free.pco.get-results "1")))
+  (expect "carol's full current balance counts once"
+    [2695200.0 0.0 4800.0] (at 'scores r)))
+(commit-tx)
+
+(begin-tx "vote key: register, hot key votes, main never locked out, clear")
+;; never-registered default: inactive, main guard
+(expect "unregistered default is inactive" false
+  (at 'active (free.pco.get-vote-key "whale")))
+;; register under the MAIN guard (scoped VOTE-KEY-ADMIN signature)
+(env-data { "carol-vk": { "keys": ["carol-hot"], "pred": "keys-all" } })
+(env-sigs [ { "key": "carol-key", "caps": [(free.pco.VOTE-KEY-ADMIN "carol" (create-principal (read-keyset 'carol-vk)))] } ])
+(expect "registration under the main guard" "vote key set"
+  (free.pco.set-vote-key "carol" (read-keyset 'carol-vk)))
+(expect "registration is active" true
+  (at 'active (free.pco.get-vote-key "carol")))
+;; the HOT key alone re-votes; weight = current balance, replaced in place
+(env-sigs [ { "key": "carol-hot", "caps": [(free.pco.VOTE "1" "carol")] } ])
+(free.pco.cast-vote "1" "carol" [1])
+(expect "hot-key re-vote recorded" [1]
+  (at 'ranking (free.pco.get-ballot "1" "carol")))
+;; the MAIN guard still votes while a key is active — lockout impossible
+(env-sigs [ { "key": "carol-key", "caps": [(free.pco.VOTE "1" "carol")] } ])
+(free.pco.cast-vote "1" "carol" [0])
+(expect "main guard voted it back" [0]
+  (at 'ranking (free.pco.get-ballot "1" "carol")))
+;; replace: a new registration overwrites the old hot key
+(env-data { "carol-vk2": { "keys": ["carol-hot2"], "pred": "keys-all" } })
+(env-sigs [ { "key": "carol-key", "caps": [(free.pco.VOTE-KEY-ADMIN "carol" (create-principal (read-keyset 'carol-vk2)))] } ])
+(free.pco.set-vote-key "carol" (read-keyset 'carol-vk2))
+(env-sigs [ { "key": "carol-hot2", "caps": [(free.pco.VOTE "1" "carol")] } ])
+(free.pco.cast-vote "1" "carol" [2 0])
+(expect "replacement hot key votes" [2 0]
+  (at 'ranking (free.pco.get-ballot "1" "carol")))
+;; clear: back to main-guard-only voting
+(env-sigs [ { "key": "carol-key", "caps": [(free.pco.VOTE-KEY-ADMIN "carol" "")] } ])
+(expect "cleared under the main guard" "vote key cleared"
+  (free.pco.clear-vote-key "carol"))
+(expect "registration inactive after clear" false
+  (at 'active (free.pco.get-vote-key "carol")))
+(env-sigs [ { "key": "carol-key", "caps": [(free.pco.VOTE "1" "carol")] } ])
+(free.pco.cast-vote "1" "carol" [0])
+(expect "main guard votes after clear" [0]
+  (at 'ranking (free.pco.get-ballot "1" "carol")))
+;; guard hand-over kills the old owner's vote key: re-register, then rotate
+(env-data { "carol-new": { "keys": ["carol-new-key"], "pred": "keys-all" }
+          , "carol-vk": { "keys": ["carol-hot"], "pred": "keys-all" } })
+(env-sigs [ { "key": "carol-key", "caps": [(free.pco.VOTE-KEY-ADMIN "carol" (create-principal (read-keyset 'carol-vk)))] } ])
+(free.pco.set-vote-key "carol" (read-keyset 'carol-vk))
+(env-sigs [ { "key": "carol-key", "caps": [(free.pco.ROTATE "carol" (create-principal (read-keyset 'carol-new)))] } ])
+(free.pco.rotate "carol" (read-keyset 'carol-new))
+(expect "rotation deactivated the previous owner's vote key" false
+  (at 'active (free.pco.get-vote-key "carol")))
+(env-sigs [ { "key": "carol-hot", "caps": [(free.pco.VOTE "1" "carol")] } ])
+(expect-failure "old hot key is dead after the hand-over"
+  "neither account guard nor registered vote key satisfied"
+  (free.pco.cast-vote "1" "carol" [1]))
+(rollback-tx)
+
+(begin-tx "release-votes is a harmless public sync")
+(env-keys ["attacker-key"])
+(expect "public release cannot change a correct tally" "synced"
+  (free.pco.release-votes "carol"))
+(let ((r (free.pco.get-results "1")))
+  (expect "scores unchanged" [2695200.0 0.0 4800.0] (at 'scores r)))
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; Cross-chain: step-0 debit releases votes and yields; wrong chains rejected
+;; ---------------------------------------------------------------------------
+(env-data { "carol": { "keys": ["carol-key"], "pred": "keys-all" }
+          ;; cross-chain receivers must be PRINCIPALS (a vanity name on the target
+          ;; chain is squattable, which would strand the transfer permanently)
+          , "carol-x": { "keys": ["cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33"], "pred": "keys-all" } })
+(begin-tx "xchain to a nonexistent chain rejected (audit M-1)")
+(env-sigs [ { "key": "carol-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "carol" "k:cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33" 10.0 "25")] } ])
+(expect-failure "invalid target chain rejected before any debit"
+  "not a valid chain id"
+  (free.pco.transfer-crosschain "carol" "k:cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33" (read-keyset 'carol-x) "25" 10.0))
+(rollback-tx)
+
+(begin-tx "xchain to same chain rejected")
+(env-sigs [ { "key": "carol-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "carol" "k:cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33" 10.0 "0")] } ])
+(expect-failure "same-chain xchain rejected" "same chain"
+  (free.pco.transfer-crosschain "carol" "k:cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33" (read-keyset 'carol-x) "0" 10.0))
+(rollback-tx)
+
+(begin-tx "xchain step 0: debit + release + yield")
+(env-sigs [ { "key": "carol-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "carol" "k:cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33" 100000.0 "5")] } ])
+(free.pco.transfer-crosschain "carol" "k:cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33" (read-keyset 'carol-x) "5" 100000.0)
+(expect "carol debited on the source chain" 498500.0 (free.pco.get-balance "carol"))
+(let ((r (free.pco.get-results "1")))
+  ;; carol's ballot [0] shrank by 100,000 -> -300,000 points on option 0
+  (expect "the moved weight left the scores BEFORE leaving the chain"
+    [2395200.0 0.0 4800.0] (at 'scores r)))
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; Tally freeze at close + active-index pruning
+;; ---------------------------------------------------------------------------
+(begin-tx "voting closes at close-at")
+(env-chain-data { "block-time": (time "2026-08-09T00:00:01Z") })  ; 168h + margin
+(env-sigs [ { "key": "carol-key", "caps": [(free.pco.VOTE "1" "carol")] } ])
+(expect-failure "no votes after close" "voting closed"
+  (free.pco.cast-vote "1" "carol" [1]))
+(expect "closed flag set" true (at 'closed (free.pco.get-results "1")))
+(expect "active index self-prunes" [] (free.pco.open-ids))
+;; post-close transfers no longer touch the frozen tally
+(env-sigs [ { "key": "carol-key"
+            , "caps": [(free.pco.TRANSFER "carol" "holder" 400000.0)] } ])
+(free.pco.transfer "carol" "holder" 400000.0)
+(let ((r (free.pco.get-results "1")))
+  (expect "scores frozen after close" [2395200.0 0.0 4800.0] (at 'scores r)))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; Rotation: account-level guard rotation
+;; ---------------------------------------------------------------------------
+(begin-tx "vanity account can rotate; principal cannot escape its guard")
+(env-data { "small": { "keys": ["small-key"], "pred": "keys-all" }
+          , "small2": { "keys": ["small2-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER "whale" "small" 10.0)] } ])
+(free.pco.transfer-create "whale" "small" (read-keyset 'small) 10.0)
+(env-sigs [ { "key": "small-key", "caps": [(free.pco.ROTATE "small" (create-principal (read-keyset 'small2)))] } ])
+(free.pco.rotate "small" (read-keyset 'small2))
+(env-sigs [ { "key": "small2-key"
+            , "caps": [(free.pco.TRANSFER "small" "holder" 10.0)] } ])
+(free.pco.transfer "small" "holder" 10.0)
+(expect "rotated guard controls the account" 0.0 (free.pco.get-balance "small"))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; Module upgrade: keyset-gated, rotation moves the power (F1/F4 rehearsal)
+;; ---------------------------------------------------------------------------
+;; NOTE: asserting a FAILING (load ...) in-suite corrupts repl state
+;; (verified 5.4 artifact), so upgrade denial is proven via the equivalent
+;; governance acquisition path instead - acquire-module-admin runs the
+;; module's GOVERNANCE cap exactly as an upgrade would.
+(begin-tx "governance rejected without the keyset")
+(env-keys ["attacker-key"])
+(expect-failure "no admin, no module admin" "Keyset failure"
+  (acquire-module-admin free.pco))
+(rollback-tx)
+
+(begin-tx "upgrade succeeds under 2-of-3")
+(env-data
+  { "ns": "free", "upgrade": true
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+ })
+(env-keys ["ledger-a", "ledger-c"])
+(load "../contracts/pco.pact")
+(expect "state survives the upgrade" 1000000.0 (free.pco.chain-minted))
+(commit-tx)
+
+(begin-tx "ROTATION: swap ledger-c out for ledger-d")
+(env-data { "pco-gov-v2": { "keys": ["ledger-a", "ledger-b", "ledger-d"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])   ; 2 of the CURRENT keyset authorize the rotation
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov-v2))
+(commit-tx)
+
+(begin-tx "old pair with the removed key can no longer govern")
+(env-keys ["ledger-c", "ledger-a"])   ; c is gone: only ONE live key signs
+(expect-failure "rotated-out pair rejected" "Keyset failure"
+  (acquire-module-admin free.pco))
+(rollback-tx)
+
+(begin-tx "new pair governs; reserve control followed the rotation")
+(env-data
+  { "ns": "free", "upgrade": true
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+
+  , "sink": { "keys": ["sink-key"], "pred": "keys-all" } })
+(env-keys ["ledger-d", "ledger-b"])
+(load "../contracts/pco.pact")
+;; the r: reserve account now answers to the NEW keyset - no account
+;; rotation was needed anywhere:
+(env-sigs [ { "key": "ledger-d", "caps": [(free.pco.TRANSFER "r:free.pco-gov" "sink" 5.0)] }
+          , { "key": "ledger-b", "caps": [(free.pco.TRANSFER "r:free.pco-gov" "sink" 5.0)] } ])
+(free.pco.transfer-create "r:free.pco-gov" "sink" (read-keyset 'sink) 5.0)
+(expect "reserve spends under the ROTATED keyset" 99995.0
+  (free.pco.get-balance "r:free.pco-gov"))
+(rollback-tx)
+
+(print "pco.repl: ALL TESTS PASSED")

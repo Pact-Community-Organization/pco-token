@@ -1,0 +1,160 @@
+;; frozen.repl — a FROZEN, FUNDED system must still work.
+;;
+;; U-6 in docs/PROPERTY-SPEC.md, and the last of the three gaps a test-integrity
+;; audit found. `ops-recovery.repl` proves the ops authority survives a freeze,
+;; but it never mints, so the paths that actually hold value — transfer, vote,
+;; claim, sweep — were unproven against a frozen pair. Those are precisely the
+;; ones where a mistake traps tokens rather than merely annoying an operator.
+;;
+;; The rule being tested (founder, 2026-07-29): FROZEN-MODULE locks the CODE and
+;; nothing else. Every admin and public operation must continue to work. A
+;; frozen system that cannot pay out, cannot be swept, or cannot be re-pointed
+;; has trapped its own funds, and the freeze is meant to be the SAFE end state.
+;;
+;; One consequence is inherent to Pact and is asserted here so nobody mistakes
+;; it for a defect: the module's governance capability gates BOTH redefinition
+;; and `acquire-module-admin`, so freezing necessarily also closes direct table
+;; writes. That is the intended trade — after the flip, nobody edits state
+;; behind the functions, including governance.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "deploy the live pair, mint, fund the pool")
+(env-data
+  { "ns": "free", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "holder": { "keys": ["holder-key"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(load "../contracts/pco-claim.pact")
+(free.pco.init-mint
+  [ { "account": (free.pco-claim.pool-account)
+    , "guard": (free.pco-claim.pool-guard), "amount": 900000.0 }
+  , { "account": "holder", "guard": (read-keyset 'holder), "amount": 100000.0 } ])
+(commit-tx)
+
+(begin-tx "ops authority + an open round, while still unfrozen")
+(env-data { "ops": { "keys": ["ledger-a"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco.set-ops-guard (read-keyset 'ops))
+(free.pco-claim.create-round "frozen-round" (hash "frozen-code") 100.0 1000.0
+  (time "2026-07-01T00:00:00Z") (time "2026-12-31T00:00:00Z"))
+(free.pco-claim.set-open true)
+(free.pco.create-proposal "frz" "does a frozen system still work?" ["a" "b"] 720)
+(commit-tx)
+
+(begin-tx "U-6: the pool pays out while the pair is live")
+;; Runs BEFORE any freeze. It has to: a funded pco-claim can no longer be frozen
+;; at all (its deploy footer refuses), so "claim from a funded pool" is only
+;; reachable pre-freeze - and the sweep below is what makes the freeze legal.
+(env-data { "nc": { "keys": ["f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0"], "pred": "keys-all" } })
+(env-keys [])
+(expect "the pool pays out" "claimed"
+  (free.pco-claim.claim "frozen-round"
+    "k:f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0"
+    (read-keyset 'nc) "frozen-code"))
+(expect "the claimant holds the round amount" 100.0
+  (free.pco.get-balance "k:f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0"))
+(rollback-tx)
+
+(begin-tx "the sanctioned order, step 2: close, then SWEEP - value is not trapped")
+;; RUNBOOK D order: close + sweep FIRST, then freeze pco, then re-pin pco-claim,
+;; then freeze pco-claim. The sweep is now a PRECONDITION of the freeze rather
+;; than a demonstration after it.
+;;
+;; It must run before pco is frozen, and the reason is the finding this ordering
+;; exists to respect: pco-claim pins pco's hash, so the moment pco is frozen
+;; WITHOUT blessing that hash, every pco-claim -> pco call dies with
+;; "hash not blessed" - including sweep-pool. An earlier draft of this file put
+;; the sweep between the two freezes and hit exactly that, which is the F2
+;; mechanism reproducing itself in the test suite.
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco-claim.set-open false)
+(expect "the whole remaining pool is recoverable" "swept 900000.0"
+  (free.pco-claim.sweep-pool "r:free.pco-gov" (keyset-ref-guard "free.pco-gov")))
+(expect "nothing is left behind" 0.0 (free.pco-claim.pool-balance))
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; THE FREEZE — both modules, in the sanctioned order: pco first, then the
+;; dependent redeployed so it re-pins the frozen pco.
+;; ---------------------------------------------------------------------------
+(begin-tx "freeze pco")
+(env-data { "ns": "free", "upgrade": true
+          , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0 })
+(env-keys ["ledger-a", "ledger-b"])
+(namespace "free")
+(load "fixtures/frozen-pco.pact")
+(commit-tx)
+
+(begin-tx "freeze pco-claim (re-pins the frozen pco)")
+(env-data { "ns": "free", "upgrade": true
+          , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0 })
+(env-keys ["ledger-a", "ledger-b"])
+(namespace "free")
+(load "fixtures/frozen-pco-claim.pact")
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; U-6 — every funded path still works.
+;; ---------------------------------------------------------------------------
+(begin-tx "U-6: a holder can still transfer")
+(env-data { "sink": { "keys": ["sink-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "holder-key", "caps": [(free.pco.TRANSFER "holder" "sink" 25.0)] } ])
+(free.pco.transfer-create "holder" "sink" (read-keyset 'sink) 25.0)
+(expect "the transfer landed on a frozen module" 25.0 (free.pco.get-balance "sink"))
+(rollback-tx)
+
+(begin-tx "U-6: a holder can still vote")
+(env-sigs [ { "key": "holder-key", "caps": [(free.pco.VOTE "1" "holder")] } ])
+(expect "governance still functions" "vote recorded"
+  (free.pco.cast-vote "1" "holder" [0]))
+(expect "and the tally moved" 100000.0 (at 'turnout (free.pco.get-proposal "1")))
+(rollback-tx)
+
+(begin-tx "U-6: ops can still operate a frozen pair")
+(env-keys ["ledger-a"])
+(expect "the round can still be paused" "round deactivated"
+  (free.pco-claim.set-round-active "frozen-round" false))
+(rollback-tx)
+
+(begin-tx "U-6: governance can still re-point the ops authority")
+(env-data { "ops2": { "keys": ["ledger-c"], "pred": "keys-all" } })
+(env-keys ["ledger-b", "ledger-c"])
+(expect "who operates stays changeable forever" "ops guard set"
+  (free.pco.set-ops-guard (read-keyset 'ops2)))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; What the freeze DOES close, asserted so it is not mistaken for a bug.
+;; ---------------------------------------------------------------------------
+(begin-tx "the code is locked, and so is the silent write route")
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "module admin is unobtainable once frozen" "Module is frozen"
+  (acquire-module-admin free.pco))
+(expect-failure "the dependent is locked too" "Module is frozen"
+  (acquire-module-admin free.pco-claim))
+(rollback-tx)
+
+;; The gas station must NEVER be frozen, and that refusal is asserted in its own
+;; file: tests/frozen-station.repl-must-fail. It cannot live here, because a
+;; failed `load` inside an active namespace leaves the REPL resolving every bare
+;; builtin into that namespace (`free.rollback-tx`, `free.expect-failure`), so
+;; nothing can follow it in the same file.
+
+(print "frozen.repl: ALL TESTS PASSED")

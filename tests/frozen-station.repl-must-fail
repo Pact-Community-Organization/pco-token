@@ -1,0 +1,58 @@
+;; frozen-station.repl-must-fail — THIS FILE MUST FAIL TO LOAD.
+;;
+;; A `.repl-must-fail` file is how this repo asserts "the engine itself refuses
+;; this", where a passing load would BE the defect. run.sh requires both that it
+;; fails AND that it fails for the right reason - a file that fails for some
+;; unrelated reason is a test that has quietly stopped testing anything.
+;;
+;; THE PROPERTY: the PCO gas station must never be frozen, and the freeze must be
+;; unshippable rather than merely discouraged.
+;;
+;; ADR-PCO-014:56-58 already said it must never be frozen. Nothing enforced it:
+;; the flip was one word in a defconst, and a mutation audit confirmed that
+;; deleting GOVERNANCE's `(enforce (not FROZEN-MODULE))` broke no test at all.
+;;
+;; WHY it must never be frozen: `withdraw` calls `coin.transfer`, so this module
+;; pins `coin` at RUNTIME. When `coin` is upgraded, a frozen station can never
+;; bless the new hash, and an unblessed dependency kills `withdraw` - stranding
+;; the float with no code path left to recover it. Freezing also buys nothing
+;; here, because every admin action already has its own capability gated on the
+;; community keyset alone. So the freeze would remove an ability and add no
+;; safety whatsoever.
+;;
+;; The station's deploy footer therefore enforces `(not FROZEN-MODULE)` OUTSIDE
+;; the fresh/upgrade `if`, so a frozen station is refused on both deploy paths.
+;; Delete that enforce and this file starts LOADING, which run.sh reports as a
+;; failure.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin (the station references coin)")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "attempt to deploy a FROZEN gas station")
+(env-data
+  { "ns": "free", "upgrade": false
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+
+;; fixtures/frozen-pco-gas-station.pact is generated from the real contract by
+;; fixtures/make-frozen-pco.sh with FROZEN-MODULE flipped to true. The load must
+;; abort with "the station must never be frozen - it pins coin at runtime and
+;; would strand the float".
+(load "fixtures/frozen-pco-gas-station.pact")
+
+;; Unreachable. If control gets here the station accepted the freeze flag.
+(print "REACHED: a frozen gas station DEPLOYED - the footer enforce is gone")
+(commit-tx)

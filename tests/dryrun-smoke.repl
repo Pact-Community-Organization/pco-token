@@ -1,0 +1,130 @@
+;; dryrun-smoke.repl — the GENERATED throwaway contracts must behave exactly
+;; like the real ones.
+;;
+;; Run `ops/make-dryrun.sh` first; this suite loads its output from
+;; ops/out/dryrun/. It exists because a renamed copy is still a copy, and a
+;; mainnet dry run that measures a subtly different contract measures nothing.
+;; If this suite passes, the only difference between what gets deployed to the
+;; throwaway namespace and what we intend to ship is the name.
+;;
+;; Deliberately SMALL: supply 100.0, not 1,000,000, so no figure produced here
+;; can be mistaken for the real deployment's.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "deploy the GENERATED dry-run pair")
+(env-data
+  { "ns": "free"
+  , "upgrade": false
+  , "symbol": "PCODRY", "precision": 12, "total-supply": 100.0
+  , "pco-dryrun-gov": { "keys": ["throwaway"], "pred": "keys-all" }
+  , "ns-guard": { "keys": ["throwaway"], "pred": "keys-all" } })
+(env-keys ["throwaway"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-dryrun-gov" (read-keyset 'pco-dryrun-gov))
+(load "../ops/out/dryrun/pco-dryrun.pact")
+(load "../ops/out/dryrun/pco-claim-dryrun.pact")
+(commit-tx)
+
+;; the rename must be total: the real names must NOT exist in this world
+(expect "the dry-run token is its own module" "PCODRY" free.pco-dryrun.SYMBOL)
+(expect "supply is the small throwaway figure" 100.0 free.pco-dryrun.TOTAL-SUPPLY)
+;; describe-module returns `code` VERBATIM, comments included - so the warning
+;; reaches anyone who inspects the deployed module, which is why it lives in the
+;; source and not only in a README.
+(expect "the throwaway warning reaches anyone who inspects the deployed module"
+  true
+  (contains "THROWAWAY TEST DEPLOYMENT"
+    (at 'code (describe-module "free.pco-dryrun"))))
+
+(begin-tx "mint 90 pool / 10 reserve")
+(env-keys ["throwaway"])
+(free.pco-dryrun.init-mint
+  [ { "account": (free.pco-claim-dryrun.pool-account)
+    , "guard": (free.pco-claim-dryrun.pool-guard)
+    , "amount": 90.0 }
+  , { "account": "r:free.pco-dryrun-gov"
+    , "guard": (keyset-ref-guard "free.pco-dryrun-gov")
+    , "amount": 10.0 } ])
+(commit-tx)
+
+(expect "pool funded" 90.0 (free.pco-claim-dryrun.pool-balance))
+(expect "one-shot mint recorded" 100.0 (free.pco-dryrun.chain-minted))
+
+;; the cross-module self-registration must survive the rename — this is the
+;; wiring most likely to break in a renamed copy, because it names the OTHER
+;; module explicitly
+(expect "the pool self-registered with the RENAMED token" true
+  (free.pco-dryrun.non-voting? (free.pco-claim-dryrun.pool-account)))
+
+(begin-tx "ops authority, round, open")
+(env-data { "ops": { "keys": ["throwaway"], "pred": "keys-all" } })
+(env-keys ["throwaway"])
+(free.pco-dryrun.set-ops-guard (read-keyset 'ops))
+(free.pco-claim-dryrun.create-round "dry-1" (hash "dry-code") 10.0 50.0
+  (time "2026-08-01T00:00:00Z") (time "2026-08-31T00:00:00Z"))
+(free.pco-claim-dryrun.set-open true)
+(commit-tx)
+
+(begin-tx "a claim pays out")
+(env-data { "u1": { "keys": ["1111111111111111111111111111111111111111111111111111111111111111"], "pred": "keys-all" } })
+(env-keys [])
+(expect "claim succeeds on the renamed pair" "claimed"
+  (free.pco-claim-dryrun.claim "dry-1"
+    "k:1111111111111111111111111111111111111111111111111111111111111111"
+    (read-keyset 'u1) "dry-code"))
+(commit-tx)
+
+(expect "claimant holds the round amount" 10.0
+  (free.pco-dryrun.get-balance
+    "k:1111111111111111111111111111111111111111111111111111111111111111"))
+(expect "pool debited by exactly the round amount" 80.0
+  (free.pco-claim-dryrun.pool-balance))
+
+(begin-tx "governance: propose, vote, read the authoritative result")
+(env-keys ["throwaway"])
+(free.pco-dryrun.create-proposal "dry" "does the renamed pair govern?" ["a" "b"] 72)
+(env-sigs [ { "key": "1111111111111111111111111111111111111111111111111111111111111111"
+            , "caps": [(free.pco-dryrun.VOTE "1"
+                        "k:1111111111111111111111111111111111111111111111111111111111111111")] } ])
+(expect "a ballot is recorded" "vote recorded"
+  (free.pco-dryrun.cast-vote "1"
+    "k:1111111111111111111111111111111111111111111111111111111111111111" [0]))
+(expect "the head-to-head result is readable" true
+  (!= 0 (length (at 'pairs (free.pco-dryrun.get-head-to-head "1")))))
+(commit-tx)
+
+;; the pool must still be refused, on the renamed pair
+(begin-tx "the pool cannot vote here either")
+(env-keys ["throwaway"])
+(expect-failure "escrow exclusion survives the rename" "registered as non-voting"
+  (free.pco-dryrun.cast-vote "1" (free.pco-claim-dryrun.pool-account) [0]))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; TEARDOWN — the part that makes this a dry run rather than a deployment.
+;; If this does not work in the REPL it will not work on mainnet, and the run
+;; must not start.
+;; ---------------------------------------------------------------------------
+(begin-tx "teardown: close and sweep the pool to the operator")
+(env-keys ["throwaway"])
+(free.pco-claim-dryrun.set-open false)
+(env-data { "sink": { "keys": ["throwaway"], "pred": "keys-all" } })
+(expect "the pool sweeps clean" "swept 80.0"
+  (free.pco-claim-dryrun.sweep-pool "r:free.pco-dryrun-gov"
+    (keyset-ref-guard "free.pco-dryrun-gov")))
+(expect "nothing is left in the pool" 0.0 (free.pco-claim-dryrun.pool-balance))
+(commit-tx)
+
+(print "dryrun-smoke.repl: ALL TESTS PASSED")

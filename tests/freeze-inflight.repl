@@ -1,0 +1,173 @@
+;; freeze-inflight.repl — a cross-chain transfer that is IN FLIGHT when the
+;; freeze lands. Proves both halves: it strands without the bless, and it
+;; recovers with it.
+;;
+;; WHY THIS IS THE MOST DANGEROUS MOMENT IN THE SYSTEM. `transfer-crosschain` is
+;; a two-step defpact. Step 0 debits the sender on the source chain and yields;
+;; step 1 credits the receiver on the target chain. Step 1 has NO ROLLBACK. A
+;; defpact resumes against the module hash it STARTED under, and flipping
+;; FROZEN-MODULE CHANGES the module hash. So a freeze that lands between step 0
+;; and step 1, without blessing the pre-freeze hash, destroys those tokens
+;; outright: debited on the source chain, uncreditable on the target, forever,
+;; and `chain-minted` keeps reporting full supply because a cross-chain send
+;; never touches the supply row.
+;;
+;; The freeze is also the one deploy that can never be repeated or corrected, so
+;; this cannot be fixed after the fact. It has to be right the first time, which
+;; is why `build-tx.ts freeze` now derives the bless list from the chain instead
+;; of leaving it to a hand edit.
+;;
+;; Neither half of this was tested before: `grep "bless" tests/*.repl` returned
+;; zero, and the audit recorded the whole bless discipline as ABSENT from the
+;; suite while RUNBOOK called it out as a HIGH-severity failure mode.
+;;
+;; `continue-pact` drives a defpact resume in the REPL (verified on pact 5.4), so
+;; this needs no SPV. What SPV would add is proof validation, not the module-pin
+;; behaviour under test here.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "deploy the UNFROZEN token + mint")
+(env-data
+  { "ns": "free", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "whale": { "keys": ["whale-key"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(free.pco.init-mint
+  [ { "account": "whale", "guard": (read-keyset 'whale), "amount": 1000000.0 } ])
+(commit-tx)
+
+
+;; ===========================================================================
+;; PART A — THE STRANDING. Freeze without blessing the pre-freeze hash and the
+;; in-flight transfer can never complete.
+;; ===========================================================================
+(begin-tx "A: step 0, then the freeze lands WITHOUT blessing the pre-freeze hash")
+;; ONE transaction on purpose. The REPL does not retain a defpact's execution
+;; environment across commit-tx: a continue-pact in a later transaction dies with
+;; "No defpact id or execution environment supplied". An earlier draft of this
+;; file split the steps and its expect-failure still went green - matching
+;; "not blessed" raised while RESOLVING the frozen module, never reaching the
+;; resume at all. That is a test passing for the wrong reason, which is the exact
+;; defect class this remediation exists to remove, so it is recorded here.
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "whale" "k:1111111111111111111111111111111111111111111111111111111111111111" 500.0 "1")] } ])
+(env-data { "rg": { "keys": ["1111111111111111111111111111111111111111111111111111111111111111"], "pred": "keys-all" } })
+(free.pco.transfer-crosschain "whale"
+  "k:1111111111111111111111111111111111111111111111111111111111111111"
+  (read-keyset 'rg) "1" 500.0)
+(expect "step 0 debited the sender - the tokens have LEFT chain 0" 999500.0
+  (free.pco.get-balance "whale"))
+
+;; the freeze lands mid-flight, blessing only a valid-format PLACEHOLDER - i.e.
+;; not the hash this defpact started under. Exactly the hand-edit mistake the
+;; build-tx freeze step now exists to make impossible.
+(env-data { "ns": "free", "upgrade": true
+          , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0 })
+(env-keys ["ledger-a", "ledger-b"])
+(namespace "free")
+(load "fixtures/frozen-pco.pact")
+
+;; THE MECHANISM, measured on pact 5.4 rather than assumed:
+;;
+;;   a cross-chain yield carries a PROVENANCE of (target-chain, module-hash), and
+;;   on resume the engine accepts it only if that hash is in
+;;       {the module's CURRENT hash} u {every hash the module BLESSES}
+;;
+;; Here the yield's provenance is the pre-freeze hash, the frozen module has a new
+;; current hash, and the only blessed value is a placeholder - so the set contains
+;; neither and the resume is refused permanently. The error names both sides,
+;; which is why it is matched on rather than a generic failure: it proves the
+;; refusal is the provenance check and not some unrelated abort.
+(env-chain-data { "chain-id": "1", "block-time": (time "2026-08-01T00:00:00Z") })
+(expect-failure "the resume is refused: the pre-freeze hash is not in the accepted provenance set"
+  "Yield provenance does not match"
+  (continue-pact 1))
+(rollback-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "B1: deploy the same unfrozen token in a second namespace")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(env-data
+  { "ns": "ok", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "whale": { "keys": ["whale-key"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "ok" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "ok")
+(define-keyset "ok.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(ok.pco.init-mint
+  [ { "account": "whale", "guard": (read-keyset 'whale), "amount": 1000000.0 } ])
+(commit-tx)
+
+(begin-tx "B: step 0, then the freeze lands BLESSING the pre-freeze hash")
+;; A module hash is NAMESPACE-SCOPED: identical source in `free` and `ok` hashes
+;; differently, so a fixture generated against the wrong namespace would bless
+;; nothing at all.
+;;
+;; There is deliberately NO hardcoded hash here. This assertion used to pin the
+;; literal, which meant every legitimate edit to contracts/pco.pact broke this
+;; file and had to be "fixed" by pasting a new value in — a stale copy waiting
+;; to happen, and the exact defect class this suite exists to catch elsewhere.
+;;
+;; The property is covered twice without a literal:
+;;   - fixtures/make-frozen-pco.sh reads the hash from a probe of THIS namespace
+;;     (:69) and REFUSES to emit a fixture that does not bless it (:85), and
+;;     tests/run.sh regenerates the fixture on every run, so it cannot go stale;
+;;   - the resume below is the real proof: if the blessed hash were wrong, the
+;;     in-flight defpact could not continue across the freeze and section C fails.
+(expect "the pre-freeze module hash is well-formed and namespace-scoped"
+  43 (length (at 'hash (describe-module "ok.pco"))))
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(ok.pco.TRANSFER_XCHAIN "whale" "k:2222222222222222222222222222222222222222222222222222222222222222" 500.0 "1")] } ])
+(env-data { "rg2": { "keys": ["2222222222222222222222222222222222222222222222222222222222222222"], "pred": "keys-all" } })
+(ok.pco.transfer-crosschain "whale"
+  "k:2222222222222222222222222222222222222222222222222222222222222222"
+  (read-keyset 'rg2) "1" 500.0)
+(expect "step 0 debited the sender" 999500.0 (ok.pco.get-balance "whale"))
+
+;; frozen-pco-blessed.pact is generated with the hash read back from the loaded
+;; module - which is what `build-tx.ts freeze` does against the live chain.
+(env-data { "ns": "ok", "upgrade": true
+          , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0 })
+(env-keys ["ledger-a", "ledger-b"])
+(namespace "ok")
+(load "fixtures/frozen-pco-blessed.pact")
+
+;; THE POSITIVE CONTROL, and it is load-bearing. If this credit ever stops
+;; landing, Part A's expect-failure becomes vacuous - it would be "failing" for
+;; some reason that has nothing to do with the bless. This assertion is what
+;; proves the resume is genuinely reached in this shape.
+(env-chain-data { "chain-id": "1", "block-time": (time "2026-08-01T00:00:00Z") })
+(continue-pact 1)
+(expect "the receiver WAS credited, despite the freeze landing mid-flight" 500.0
+  (ok.pco.get-balance "k:2222222222222222222222222222222222222222222222222222222222222222"))
+(commit-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "B5: and the module really is frozen")
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "no further upgrades" "Module is frozen"
+  (acquire-module-admin ok.pco))
+(rollback-tx)
+
+(print "freeze-inflight.repl: ALL TESTS PASSED")

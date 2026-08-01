@@ -1,0 +1,162 @@
+;; freeze-interlock.repl — the pco-claim freeze interlock must refuse a FUNDED
+;; pool and allow everything else. `frozen-pool.repl-must-fail` proves the
+;; refusal; this file proves the three cases that must SUCCEED, which is the
+;; half that was missing and the half that was wrong.
+;;
+;; Both defects here were found by the confirming cold audit, and both made the
+;; interlock fail in the SAFE-LOOKING direction — it refused freezes it should
+;; have allowed, which reads as caution and is actually a ceremony that cannot
+;; complete:
+;;
+;;  1. OFF-HUB (the serious one). The interlock read `pco.get-balance`, which
+;;     RAISES on a missing row. The pool row is written by the mint, and the
+;;     mint is hub-only — so on 19 of the 20 chains the freeze deploy aborted
+;;     with "No value found in table ... pco_accounts", refusing the freeze
+;;     because the pool was EMPTY. The sanctioned freeze order runs on all 20
+;;     chains, so as written it could only ever complete on one of them.
+;;
+;;  2. DUST VETO. `(= 0.0 ...)` let any PCO holder block the freeze forever by
+;;     sending 1e-12 to the pool, at no cost and repeatedly. The hazard the
+;;     interlock exists for is a FUNDED pool — the ~900,000 that would strand —
+;;     and dust is not that.
+;;
+;; Delete either fix and a case below fails.
+
+(env-exec-config ["RequireKeysetNs"])
+
+;; ===========================================================================
+;; CASE A — a NON-HUB chain, where the pool row was never written.
+;; This is the one that aborted on 19 of 20 chains.
+;; ===========================================================================
+(env-chain-data { "chain-id": "5", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "deploy the pair on a non-hub chain — NO mint, so no pool row")
+(env-data
+  { "ns": "free", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(load "../contracts/pco-claim.pact")
+;; The precondition that makes this case real: the row genuinely does not exist,
+;; so a plain `get-balance` would raise rather than return 0.0.
+(expect-failure "the pool account row does not exist on a non-hub chain"
+  "No value found in table"
+  (free.pco.get-balance (free.pco-claim.pool-account)))
+(expect "and the default reader returns 0.0 instead of raising"
+  0.0 (free.pco.get-balance-default (free.pco-claim.pool-account)))
+(commit-tx)
+
+(begin-tx "the freeze deploy LOADS on a chain with no pool row")
+(env-data { "ns": "free", "upgrade": true
+          , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0 })
+(env-keys ["ledger-a", "ledger-b"])
+(namespace "free")
+(load "fixtures/frozen-pco-claim.pact")
+(expect "pco-claim is frozen on the non-hub chain" true free.pco-claim.FROZEN-MODULE)
+(commit-tx)
+
+;; ===========================================================================
+;; CASE B — the hub, pool swept to dust. A stranger's residue must not veto an
+;; irreversible ceremony.
+;; ===========================================================================
+;; The interfaces and coin are already loaded (they live at the root, not in a
+;; namespace), and the modules above live in `free`. The hub cases deploy a
+;; SECOND, independent pair into `hub` — a module is namespace-scoped, so these
+;; do not collide with the frozen pair from case A.
+(begin-tx "switch to the hub chain")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(commit-tx)
+
+(begin-tx "deploy on the hub, mint, then sweep the pool down to dust")
+(env-data
+  { "ns": "hub", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "holder": { "keys": ["holder-key"], "pred": "keys-all" }
+  , "sweeper": { "keys": ["1111111111111111111111111111111111111111111111111111111111111111"], "pred": "keys-all" }
+  , "sweeper2": { "keys": ["2222222222222222222222222222222222222222222222222222222222222222"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "hub" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "hub")
+(define-keyset "hub.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(load "../contracts/pco-claim.pact")
+(hub.pco.init-mint
+  [ { "account": (hub.pco-claim.pool-account)
+    , "guard": (hub.pco-claim.pool-guard), "amount": 900000.0 }
+  , { "account": "holder", "guard": (read-keyset 'holder), "amount": 100000.0 } ])
+(expect "pool funded" 900000.0 (hub.pco-claim.pool-balance))
+(commit-tx)
+
+(begin-tx "close claiming and sweep, as the runbook requires")
+(env-keys ["ledger-a", "ledger-b"])
+(hub.pco-claim.set-open false)
+(commit-tx)
+(begin-tx "sweep")
+(env-keys ["ledger-a", "ledger-b"])
+(hub.pco-claim.sweep-pool "k:1111111111111111111111111111111111111111111111111111111111111111" (read-keyset 'sweeper))
+(expect "pool emptied by the sweep" 0.0 (hub.pco-claim.pool-balance))
+(commit-tx)
+
+;; A stranger pushes dust in AFTER the sweep. Under `(= 0.0 ...)` this alone
+;; blocked the freeze indefinitely, for 1e-12 PCO.
+(begin-tx "a stranger pushes dust into the swept pool")
+(env-sigs [ { "key": "holder-key"
+            , "caps": [(hub.pco.TRANSFER "holder" (hub.pco-claim.pool-account) 0.000000000001)] } ])
+(hub.pco.transfer "holder" (hub.pco-claim.pool-account) 0.000000000001)
+(expect "the pool now holds dust" 0.000000000001 (hub.pco-claim.pool-balance))
+(commit-tx)
+
+(begin-tx "the freeze still LOADS over dust")
+(env-data { "ns": "hub", "upgrade": true
+          , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0 })
+(env-keys ["ledger-a", "ledger-b"])
+(namespace "hub")
+(load "fixtures/frozen-pco-claim.pact")
+(expect "pco-claim froze over dust residue" true hub.pco-claim.FROZEN-MODULE)
+(commit-tx)
+
+;; POST-FREEZE RECOVERABILITY, MEASURED — not just asserted.
+;; The tolerance bounds the balance at FREEZE time and nothing bounds it after,
+;; so a stranger can push real value into the already-frozen pool. The claim
+;; that matters is that this residue is not stranded: sweep-pool is ADMIN-gated,
+;; not gated on the upgrade capability, so it still runs after the freeze. An
+;; earlier version of this file asserted only that the residue was VISIBLE,
+;; which is not the same as recoverable (a cold-pass finding). So EXERCISE the
+;; exit.
+(begin-tx "a stranger pushes real value into the FROZEN pool")
+(env-sigs [ { "key": "holder-key"
+            , "caps": [(hub.pco.TRANSFER "holder" (hub.pco-claim.pool-account) 1000.0)] } ])
+(hub.pco.transfer "holder" (hub.pco-claim.pool-account) 1000.0)
+(expect "the frozen pool now holds real value a stranger put there"
+  1000.000000000001 (hub.pco-claim.pool-balance))
+(commit-tx)
+
+(begin-tx "sweep-pool STILL WORKS after the freeze — the residue is not stranded")
+;; the freeze tx above narrowed env-data; the sweep receiver's keyset must be present
+(env-data { "sweeper2": { "keys": ["2222222222222222222222222222222222222222222222222222222222222222"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+;; claiming was closed before the earlier sweep; sweep requires it closed, which
+;; it still is. This is the ADMIN path, which the freeze does not gate.
+(hub.pco-claim.sweep-pool "k:2222222222222222222222222222222222222222222222222222222222222222"
+  (read-keyset 'sweeper2))
+(expect "the frozen pool is emptied by a post-freeze sweep" 0.0
+  (hub.pco-claim.pool-balance))
+(commit-tx)
+
+(print "== freeze interlock: allows off-hub and dust, refuses funded, residue recoverable post-freeze ==")

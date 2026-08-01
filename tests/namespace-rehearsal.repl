@@ -1,0 +1,248 @@
+;; namespace-rehearsal.repl — principal-namespace ceremony rehearsed against
+;; the BYTE-TRUE mainnet01 `ns` module source (tests/fixtures/mainnet-ns.pact,
+;; fetched from chain 0 via describe-module; hash at fetch
+;; jXT9VNDw_Wn0wsWQcLCejEQfAdpyA_GUjeINHG9Z3aU).
+;;
+;; Why this leg exists: the controllable devnet ships the OLDER ns (v1,
+;; registry-only - no create-principal-namespace, registry keys held by the
+;; community 3-of-5), so the namespace-creation step CANNOT be rehearsed
+;; on-node before mainnet. This suite installs the REAL mainnet ns code as
+;; the REPL's namespace policy and rehearses the exact ceremony:
+;;   1. derive the principal namespace name from the 2-of-3 keyset,
+;;   2. define the namespace (principal branch of ns.validate),
+;;   3. define the <ns>.pco-gov keyset inside it (2-of-3 signing),
+;;   4. prove foreign keys can define NOTHING inside the namespace,
+;;   5. prove the derivation is deterministic and keyset-sensitive.
+;; The remaining mainnet-only delta is pure transport (a signed tx instead
+;; of a REPL call); the RUNBOOK adds a read-only /local preflight that
+;; derives the name against live mainnet before any KDA is spent.
+
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+;; the mainnet ns module uses genesis-era BARE keyset names - allow them
+;; JUST for the genesis simulation; the rehearsal proper re-enables the
+;; node's RequireKeysetNs below (empirical: without that flag the REPL does
+;; NOT enforce namespace user guards on define-keyset - a bare-REPL-only
+;; looseness that must never be mistaken for chain behavior).
+(env-exec-config [])
+
+(begin-tx "install the mainnet ns module")
+(env-data
+  { "ns-admin-keyset":   { "keys": ["ns-admin-key"],   "pred": "keys-all" }
+  , "ns-operate-keyset": { "keys": ["ns-operate-key"], "pred": "keys-all" } })
+(env-keys ["ns-admin-key", "ns-operate-key"])
+(define-keyset "ns-admin-keyset" (read-keyset 'ns-admin-keyset))
+(define-keyset "ns-operate-keyset" (read-keyset 'ns-operate-keyset))
+(load "fixtures/mainnet-ns.pact")
+(create-table ns.registry)
+(commit-tx)
+
+;; from here, namespace definition is governed by the REAL mainnet policy,
+;; under the node's keyset-namespace discipline
+(env-namespace-policy false (ns.validate))
+(env-exec-config ["RequireKeysetNs"])
+
+;; ---------------------------------------------------------------------------
+;; 1+5. Derivation: deterministic, keyset-sensitive, right shape
+;; ---------------------------------------------------------------------------
+(env-data
+  { "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "other":   { "keys": ["ledger-a", "ledger-b", "ledger-x"], "pred": "keys-2" } })
+
+(begin-tx "derive the principal namespace name")
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (expect "n_ prefix" "n_" (take 2 nsname))
+  (expect "40 hex chars after the prefix" 42 (length nsname))
+  (expect "derivation is deterministic" nsname
+    (ns.create-principal-namespace (read-keyset 'pco-gov)))
+  (expect "a different keyset derives a different namespace" true
+    (!= nsname (ns.create-principal-namespace (read-keyset 'other)))))
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; 2. Define the namespace: principal branch (no registry row needed)
+;; ---------------------------------------------------------------------------
+(begin-tx "define the principal namespace")
+(env-keys ["ledger-a", "ledger-b"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (define-namespace nsname (read-keyset 'pco-gov) (read-keyset 'pco-gov))
+  (expect "namespace exists with the keyset as both guards" nsname
+    (at 'namespace-name (describe-namespace nsname))))
+(commit-tx)
+
+(begin-tx "a NON-principal name still needs the registry (mainnet behavior)")
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "arbitrary names refused without a registry row"
+  "Inactive or unregistered namespace"
+  (define-namespace "pco-community" (read-keyset 'pco-gov) (read-keyset 'pco-gov)))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; 3. Keyset definition inside the namespace, 2-of-3 signing
+;; ---------------------------------------------------------------------------
+(begin-tx "define <ns>.pco-gov inside the namespace")
+(env-keys ["ledger-b", "ledger-c"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (namespace nsname)
+  (define-keyset (format "{}.pco-gov" [nsname]) (read-keyset 'pco-gov))
+  (expect "keyset enforceable by the 2 signers" true
+    (enforce-keyset (format "{}.pco-gov" [nsname]))))
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; 3b. THE REJECTED DESIGN — evidence, NOT a ceremony step.
+;;
+;;     This system defines exactly ONE keyset (<ns>.pco-gov). There is no
+;;     <ns>.pco-ops; the ops tier is module state (pco.ops-auth, set by
+;;     pco.set-ops-guard) and its live proofs are in tests/ops-recovery.repl.
+;;
+;;     What follows re-proves the Pact semantics that FORCED that choice, on
+;;     the byte-true mainnet ns policy: FIRST definition of a keyset enforces
+;;     the namespace guard (2-of-3), but REdefinition enforces only the
+;;     CURRENT keyset's own predicate. Consequences, both asserted below:
+;;       * a compromised ops key rotates its keyset beyond governance's reach
+;;         (hijack), and
+;;       * a governance pair alone canNOT rotate it, so a LOST ops key strands
+;;         the tier forever (upgrade-only, and impossible after a freeze).
+;;     Do not "fix" this section to match the current design — its whole job
+;;     is to keep the discarded alternative's failure modes falsifiable.
+;; ---------------------------------------------------------------------------
+(env-data
+  { "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "pco-ops": { "keys": ["ledger-a"], "pred": "keys-all" }
+  , "new-ops": { "keys": ["ledger-y"], "pred": "keys-all" } })
+
+(begin-tx "REJECTED-DESIGN: the ops key alone cannot FIRST-define the keyset (ns guard gates it)")
+(env-keys ["ledger-a"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (namespace nsname)
+  (expect-failure "1-of-3 refused at first definition" "Keyset failure"
+    (define-keyset (format "{}.pco-ops" [nsname]) (read-keyset 'pco-ops))))
+(rollback-tx)
+
+(begin-tx "REJECTED-DESIGN: define it under the namespace guard; single-key enforceable")
+(env-keys ["ledger-a", "ledger-b"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (namespace nsname)
+  (define-keyset (format "{}.pco-ops" [nsname]) (read-keyset 'pco-ops)))
+(env-keys ["ledger-a"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (expect "the single ops key satisfies the ops keyset" true
+    (enforce-keyset (format "{}.pco-ops" [nsname]))))
+(commit-tx)
+
+(begin-tx "REJECTED-DESIGN: a foreign key cannot redefine it")
+(env-keys ["attacker-key"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (namespace nsname)
+  (expect-failure "redefinition needs the current ops predicate" "Keyset failure"
+    (define-keyset (format "{}.pco-ops" [nsname]) (read-keyset 'new-ops))))
+(rollback-tx)
+
+(begin-tx "REJECTED-DESIGN: THE LOST-KEY STRAND - governance alone cannot redefine it")
+(env-keys ["ledger-b", "ledger-c"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (namespace nsname)
+  (expect-failure "gov alone lacks rotation authority over pco-ops" "Keyset failure"
+    (define-keyset (format "{}.pco-ops" [nsname]) (read-keyset 'new-ops))))
+(rollback-tx)
+
+(begin-tx "REJECTED-DESIGN: THE HIJACK - the ops key ALONE rotates it, beyond gov reach")
+(env-keys ["ledger-a"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (namespace nsname)
+  (define-keyset (format "{}.pco-ops" [nsname]) (read-keyset 'new-ops)))
+(env-keys ["ledger-y"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (expect "the rotated-in key satisfies the rotated keyset" true
+    (enforce-keyset (format "{}.pco-ops" [nsname]))))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; 4. Foreign keys can define NOTHING inside the namespace.
+;;    (Entering a namespace is ungated reading; DEFINITIONS enforce the
+;;    namespace user guard - keysets and module installs both.)
+;; ---------------------------------------------------------------------------
+(begin-tx "one keyholder alone cannot define a keyset inside")
+(env-keys ["ledger-a"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (namespace nsname)
+  (expect-failure "1-of-3 refused" "Keyset failure"
+    (define-keyset (format "{}.solo" [nsname]) (read-keyset 'pco-gov))))
+(rollback-tx)
+
+(begin-tx "an attacker cannot define a keyset inside")
+(env-data
+  { "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "attacker": { "keys": ["attacker-key"], "pred": "keys-all" } })
+(env-keys ["attacker-key"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (namespace nsname)
+  (expect-failure "foreign keyset definition refused" "Keyset failure"
+    (define-keyset (format "{}.evil" [nsname]) (read-keyset 'attacker))))
+(rollback-tx)
+
+;; NOTE: "an attacker cannot INSTALL A MODULE inside" cannot be asserted
+;; in-suite (module forms are top-level-only, so expect-failure cannot wrap
+;; them, and a failing top-level install aborts the whole load). It is
+;; machine-checked by tests/namespace-attack.repl, a file that MUST FAIL to
+;; load with "Keyset failure" - the test runner asserts the non-zero exit.
+
+(begin-tx "an attacker cannot redefine the namespace either")
+(env-keys ["attacker-key"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (expect-failure "redefinition under a foreign guard refused" "Keyset failure"
+    (define-namespace nsname (read-keyset 'attacker) (read-keyset 'attacker))))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; The window that made the ceremony ATOMIC (cold audit 2026-07-30, MEDIUM-1).
+;;
+;; The test above proves REdefinition is refused once the namespace exists. That
+;; is the adjacent property, not the dangerous one, and passing it was part of
+;; why the real gap survived: a FIRST definition enforces no signature at all,
+;; because `ns.validate` constrains only the ADMIN guard. Anyone who learns the
+;; governance keyset — which the ceremony transaction itself carries in env-data —
+;; can create the namespace unsigned, take the USER guard, and first-define
+;; `<ns>.pco-gov` as their own keyset. Governance reclaims the namespace (it holds
+;; the admin guard) but can NEVER reclaim the keyset: keyset redefinition enforces
+;; the CURRENT keyset, not the namespace guard.
+;;
+;; So what protects us is not secrecy and not signatures — it is that build-tx
+;; emits `define-namespace` + `define-keyset` in ONE transaction, leaving no
+;; instant where the namespace exists and the keyset does not. These cases pin
+;; both halves: the keyset really is claimable by whoever holds the user guard,
+;; and once WE hold it, an attacker is refused.
+;; ---------------------------------------------------------------------------
+
+(begin-tx "the keyset is claimable by whoever holds the namespace user guard")
+;; Governance holds the user guard here (claimed atomically above), so with only
+;; an attacker key present the keyset cannot be taken.
+(env-keys ["attacker-key"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (namespace nsname)
+  (expect-failure "an outsider cannot first-define the governance keyset"
+    "Keyset failure"
+    (define-keyset (+ nsname ".pco-gov") (read-keyset 'attacker))))
+(rollback-tx)
+
+(begin-tx "governance CAN define its own keyset in the namespace it holds")
+(env-keys ["ledger-a", "ledger-b"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (namespace nsname)
+  (define-keyset (+ nsname ".pco-gov") (read-keyset 'pco-gov))
+  (expect "the governance keyset is ours and A+B satisfy it" true
+    (enforce-keyset (+ nsname ".pco-gov"))))
+(commit-tx)
+
+(begin-tx "and once ours, an attacker can never take it")
+(env-keys ["attacker-key"])
+(let ((nsname (ns.create-principal-namespace (read-keyset 'pco-gov))))
+  (namespace nsname)
+  ;; Redefinition enforces the CURRENT keyset — the one thing governance could
+  ;; never have recovered had an attacker won the race.
+  (expect-failure "redefining the governance keyset is refused" "Keyset failure"
+    (define-keyset (+ nsname ".pco-gov") (read-keyset 'attacker))))
+(rollback-tx)
+
+(print "namespace-rehearsal.repl: ALL TESTS PASSED")

@@ -1,0 +1,40 @@
+;; hash-probe.repl — print pco's real module hash, and nothing else.
+;;
+;; make-frozen-pco.sh captures this to generate frozen-pco-blessed.pact, the
+;; fixture that blesses the ACTUAL pre-freeze hash. A placeholder cannot be used
+;; there: the whole point of that fixture is to prove that blessing the right
+;; hash is what lets an in-flight cross-chain defpact resume across a freeze,
+;; and any wrong value proves only the failure half.
+;;
+;; NAMESPACE MATTERS: a module hash is namespace-scoped, so free.pco and ok.pco
+;; hash DIFFERENTLY from identical source. This probes `ok`, which is the
+;; namespace freeze-inflight.repl loads the blessed fixture into. Probing a
+;; different namespace produces a hash that looks perfectly valid and blesses
+;; nothing - which cost one debugging round.
+;;
+;; The hash is deterministic for a given contracts/pco.pact plus these fixtures
+;; (it covers dependency hashes too), so regenerating is reproducible. It
+;; EXCLUDES comments and @doc, so a comment-only edit leaves it unchanged.
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(begin-tx)
+(load "fungible-v2.pact")
+(load "fungible-xchain-v1.pact")
+(load "gas-payer-v1.pact")
+(load "coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+(begin-tx)
+(env-data
+  { "ns": "ok", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "ok" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "ok")
+(define-keyset "ok.pco-gov" (read-keyset 'pco-gov))
+(load "../../contracts/pco.pact")
+(commit-tx)
+(print (format "PCO-HASH={}" [(at 'hash (describe-module "ok.pco"))]))

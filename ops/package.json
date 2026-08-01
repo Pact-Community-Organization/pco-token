@@ -1,0 +1,32 @@
+{
+  "name": "pco-token-ops",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "rehearse": "tsx src/rehearse.ts",
+    "e2e": "tsx src/e2e-user.ts",
+    "verify-deployed": "tsx src/verify-deployed.ts",
+    "spread-gas": "tsx src/spread-gas.ts",
+    "local": "tsx src/local.ts",
+    "station-status": "tsx src/station-status.ts",
+    "distinct-voters": "tsx src/distinct-voters.ts",
+    "fund": "tsx src/fund.ts",
+    "seed": "tsx src/seed.ts",
+    "events": "tsx src/event-ops.ts",
+    "dryrun": "tsx src/dryrun.ts",
+    "dryrun-gen": "./make-dryrun.sh",
+    "dryrun-submit": "tsx src/dryrun-submit.ts",
+    "dryrun-fund": "tsx src/dryrun-fund.ts",
+    "test-ops": "tsx test/ops-checks.ts"
+  },
+  "dependencies": {
+    "@kadena/client": "^1.18.3",
+    "@kadena/cryptography-utils": "^0.4.4",
+    "blakejs": "^1.2.1",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

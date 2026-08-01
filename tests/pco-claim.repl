@@ -1,0 +1,745 @@
+;; pco-claim.repl — claim distributor test suite (v2: rounds + grants).
+;;
+;; Covers: pool escrow integrity (capability-guarded, only claim/grant/sweep
+;; can debit), claim ROUNDS (create bounds, engagement-code gate + rotation,
+;; time window, per-round budget, one-claim-per-account-PER-ROUND, cross-round
+;; claims by the same account), judged GRANTS (bounds, public reason), the
+;; daily ops meter (charge, cap boundary, epoch roll), the master open/close
+;; switch, the two privilege tiers (routine ops = 1-key pco-ops with a 2-of-3
+;; governance fallback; sweep stays 2-of-3), ops-keyset rotation,
+;; sweep-after-close, and conservation (pool + distributed + reserve = total
+;; supply at every step). Key roles: ledger-a = the ops seat;
+;; ledger-b / ledger-c = the other governance seats.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+;; ---------------------------------------------------------------------------
+;; Setup: interfaces + namespace + keyset + token + claim + mint
+;; ---------------------------------------------------------------------------
+(begin-tx "interfaces + coin (pco references coin.VALID_CHAIN_IDS)")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "deploy")
+(env-data
+  { "ns": "free"
+  , "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "gov-threshold": 0.001
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "pco-ops": { "keys": ["ledger-a"], "pred": "keys-all" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+;; NOTE: there is no `pco-ops` KEYSET any more. The ops authority is module
+;; state in `pco`, named by governance — so there is no undefined-keyset
+;; failure mode to defend against, and no keyset the ops device can hijack.
+(load "../contracts/pco.pact")
+(load "../contracts/pco-claim.pact")
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; OPS AUTHORITY: governance-owned, always recoverable
+;; ---------------------------------------------------------------------------
+(begin-tx "before any set: ops defaults to governance, so nothing is stranded")
+(env-keys ["ledger-a", "ledger-b"])
+(expect "a governance pair operates immediately on a fresh deploy" "claims open"
+  (free.pco-claim.set-open true))
+(rollback-tx)
+
+(begin-tx "before any set: a lone ops candidate has NO authority yet")
+(env-keys ["ledger-a"])
+(expect-failure "ledger-a alone cannot operate until governance names it"
+  "ops authorization failed"
+  (free.pco-claim.set-open true))
+(rollback-tx)
+
+(begin-tx "governance names the ops authority (1-of-2 over the active devices)")
+(env-data { "ops-authority": { "keys": ["ledger-a", "ledger-b"], "pred": "keys-any" } })
+(env-keys ["ledger-a", "ledger-b"])
+(expect "governance sets the ops guard" "ops guard set"
+  (free.pco.set-ops-guard (read-keyset 'ops-authority)))
+(commit-tx)
+
+(begin-tx "the named authority now operates SOLO, on both modules")
+(env-keys ["ledger-a"])
+(expect "ops solo runs claim ops" "claims open" (free.pco-claim.set-open true))
+(expect "ops solo authors a governance question" "1"
+  (free.pco.create-proposal "ops-tier reachable" "b" ["a" "b"] 72))
+(rollback-tx)
+
+(begin-tx "1-of-2: the OTHER device operates too, so one lost device never halts ops")
+(env-keys ["ledger-b"])
+(expect "the second device operates solo" "claims open" (free.pco-claim.set-open true))
+(rollback-tx)
+
+(begin-tx "ops CANNOT re-point itself — the hijack path is closed by construction")
+(env-data { "hijack": { "keys": ["attacker"], "pred": "keys-all" } })
+(env-keys ["ledger-a"])
+(expect-failure "the ops authority cannot name its successor" "Keyset failure"
+  (free.pco.set-ops-guard (read-keyset 'hijack)))
+(rollback-tx)
+
+(begin-tx "ALWAYS RECOVERABLE: a gov pair WITHOUT the old ops device replaces it")
+;; ledger-a is 'lost' (or compromised): the quorum b+c never touches it
+(env-data { "ops-v2": { "keys": ["ledger-b"], "pred": "keys-all" } })
+(env-keys ["ledger-b", "ledger-c"])
+(expect "b+c re-point ops with no upgrade and no cooperation from a" "ops guard set"
+  (free.pco.set-ops-guard (read-keyset 'ops-v2)))
+(env-keys ["ledger-a"])
+(expect-failure "the replaced device has no authority left" "ops authorization failed"
+  (free.pco-claim.set-open true))
+(env-keys ["ledger-b"])
+(expect "the new authority operates" "claims open" (free.pco-claim.set-open true))
+(rollback-tx)
+
+(begin-tx "fixture: ops authority = ledger-a alone for the rest of the suite")
+(env-data { "ops-authority": { "keys": ["ledger-a"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco.set-ops-guard (read-keyset 'ops-authority))
+(commit-tx)
+
+(begin-tx "mint: 90% pool, 10% reserve")
+(env-keys ["ledger-a", "ledger-c"])
+(free.pco.init-mint
+  [ { "account": (free.pco-claim.pool-account)
+    , "guard": (free.pco-claim.pool-guard)
+    , "amount": 900000.0 }
+  , { "account": "r:free.pco-gov"
+    , "guard": (keyset-ref-guard "free.pco-gov")
+    , "amount": 100000.0 } ])
+(commit-tx)
+
+(expect "pool funded" 900000.0 (free.pco-claim.pool-balance))
+;; The pool registers ITSELF with the token at deploy, so the exclusion travels
+;; with the escrow instead of depending on a ceremony step. This is the property
+;; that replaced an automatic guard-type rule - if it ever regresses, ~900,000
+;; PCO of undistributed supply silently becomes votable.
+(expect "the claim pool self-registered as outside the float" true
+  (free.pco.non-voting? (free.pco-claim.pool-account)))
+(expect "and says why, publicly"
+  "pco-claim pool escrow: undistributed community tokens, outside the float"
+  (free.pco.non-voting-reason (free.pco-claim.pool-account)))
+(expect "an ordinary holder is NOT in the register" false
+  (free.pco.non-voting? "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"))
+(expect "master switch starts closed" false (at 'open (free.pco-claim.get-config)))
+
+;; the claimants: real k: principals (synthetic 64-hex keys)
+(env-data
+  { "alice-ks": { "keys": ["a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"], "pred": "keys-all" }
+  , "bob-ks":   { "keys": ["b0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb" ], "pred": "keys-all" }
+  , "carla-ks": { "keys": ["ca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51"], "pred": "keys-all" }
+  , "dana-ks":  { "keys": ["dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"], "pred": "keys-all" }
+  , "erin-ks":  { "keys": ["e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"], "pred": "keys-all" }
+  , "frank-ks": { "keys": ["facefacefacefacefacefacefacefacefacefacefacefacefacefacefaceface"], "pred": "keys-all" }
+  , "attacker": { "keys": ["attacker-key"], "pred": "keys-all" } })
+
+;; ---------------------------------------------------------------------------
+;; Rounds: creation is OPS-tier and bounded
+;; ---------------------------------------------------------------------------
+(begin-tx "round creation: a single NON-ops governance key fails both OPS branches")
+(env-keys ["ledger-b"])
+(expect-failure "non-ops single key cannot create a round" "ops authorization failed"
+  (free.pco-claim.create-round "genesis" (hash "pco-quest-1") 100.0 30000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-31T00:00:00Z")))
+(rollback-tx)
+
+(begin-tx "round creation: a foreign key fails")
+(env-keys ["attacker-key"])
+(expect-failure "foreign key cannot create a round" "ops authorization failed"
+  (free.pco-claim.create-round "genesis" (hash "pco-quest-1") 100.0 30000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-31T00:00:00Z")))
+(rollback-tx)
+
+(begin-tx "the genesis round — created by the ops key ALONE (the 1-of tier)")
+(env-keys ["ledger-a"])
+(expect "genesis created" "round genesis created"
+  (free.pco-claim.create-round "genesis" (hash "pco-quest-1") 100.0 30000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-31T00:00:00Z")))
+(expect "round row is readable" 100.0 (at 'amount (free.pco-claim.get-round "genesis")))
+(expect "budget committed to the ops meter" 30000.0 (free.pco-claim.ops-epoch-spent))
+(commit-tx)
+
+(begin-tx "duplicate round id rejected")
+(env-keys ["ledger-a"])
+(expect-failure "round ids are one-shot" "already found"
+  (free.pco-claim.create-round "genesis" (hash "other") 100.0 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-31T00:00:00Z")))
+(rollback-tx)
+
+;; scoped-signature discipline (the shape the hardware-wallet ceremony uses):
+;; a signature scoped to the OPS cap works; a signature scoped to a DIFFERENT
+;; cap does not satisfy OPS.
+(begin-tx "capability-SCOPED ops signature works; wrong scope fails")
+;; Each rotation must be a REAL change (an identical hash is refused), so these
+;; two steps rotate away and then straight back to the genesis code the rest of
+;; the suite claims with. genesis has no claims yet, so its code is still open.
+(env-sigs [ { "key": "ledger-a", "caps": [(free.pco-claim.OPS)] } ])
+(expect "ops key with a cap-scoped sig rotates a round code" "code rotated"
+  (free.pco-claim.set-round-code "genesis" (hash "scoped-sig-probe")))
+(env-sigs [ { "key": "ledger-b", "caps": [(free.pco-claim.OPS)] }
+          , { "key": "ledger-c", "caps": [(free.pco-claim.OPS)] } ])
+(expect "gov pair with cap-scoped sigs passes the fallback branch" "code rotated"
+  (free.pco-claim.set-round-code "genesis" (hash "pco-quest-1")))
+(env-sigs [ { "key": "ledger-a", "caps": [(free.pco-claim.ADMIN)] } ])
+(expect-failure "a sig scoped to a different cap does not satisfy OPS"
+  "ops authorization failed"
+  (free.pco-claim.set-round-code "genesis" (hash "pco-quest-x")))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; Master switch + claim gates
+;; ---------------------------------------------------------------------------
+(begin-tx "claim while the master switch is closed fails")
+(expect-failure "closed" "not open"
+  (free.pco-claim.claim "genesis"
+    "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"
+    (read-keyset 'alice-ks) "pco-quest-1"))
+(rollback-tx)
+
+(begin-tx "open the master switch — the ops key ALONE")
+(env-keys ["ledger-a"])
+(expect "opens" "claims open" (free.pco-claim.set-open true))
+(commit-tx)
+
+(begin-tx "unknown round fails")
+(expect-failure "no such round" "No value found in table"
+  (free.pco-claim.claim "no-such-round"
+    "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"
+    (read-keyset 'alice-ks) "pco-quest-1"))
+(rollback-tx)
+
+(begin-tx "wrong code fails")
+(expect-failure "wrong code" "wrong engagement code"
+  (free.pco-claim.claim "genesis"
+    "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"
+    (read-keyset 'alice-ks) "pco-quest-WRONG"))
+(rollback-tx)
+
+(begin-tx "non-principal account fails")
+(expect-failure "vanity name rejected" "principal of its guard"
+  (free.pco-claim.claim "genesis" "alice" (read-keyset 'alice-ks) "pco-quest-1"))
+(rollback-tx)
+
+(begin-tx "guard-account mismatch fails")
+(expect-failure "foreign guard on a k: name rejected" "principal of its guard"
+  (free.pco-claim.claim "genesis"
+    "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"
+    (read-keyset 'attacker) "pco-quest-1"))
+(rollback-tx)
+
+(begin-tx "off-hub claim fails")
+(env-chain-data { "chain-id": "9" })
+(expect-failure "hub only" "hub chain only"
+  (free.pco-claim.claim "genesis"
+    "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"
+    (read-keyset 'alice-ks) "pco-quest-1"))
+(rollback-tx)
+(env-chain-data { "chain-id": "0" })
+
+;; ---------------------------------------------------------------------------
+;; Claims: no claimer signature, one per account PER ROUND, cross-round OK
+;; ---------------------------------------------------------------------------
+(begin-tx "alice claims genesis (no signature - see module doc)")
+(env-sigs [])
+(free.pco-claim.claim "genesis"
+  "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"
+  (read-keyset 'alice-ks) "pco-quest-1")
+(expect "alice holds the round amount" 100.0
+  (free.pco.get-balance "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"))
+(expect "pool decremented" 899900.0 (free.pco-claim.pool-balance))
+(expect "claimed flag (this round)" true
+  (free.pco-claim.claimed "genesis" "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"))
+(expect "round accounting" 100.0 (at 'claimed (free.pco-claim.get-round "genesis")))
+(commit-tx)
+
+(begin-tx "double claim in the SAME round impossible")
+(expect-failure "one per account per round" "already found"
+  (free.pco-claim.claim "genesis"
+    "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"
+    (read-keyset 'alice-ks) "pco-quest-1"))
+(rollback-tx)
+
+(begin-tx "a SECOND concurrent round: same account claims again (the v2 point)")
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "quest-2" (hash "pco-quest-2") 100.0 2500.0
+  (time "2026-08-01T00:00:00Z") (time "2026-08-15T00:00:00Z"))
+(env-keys [])
+(expect "alice has not claimed quest-2 yet" false
+  (free.pco-claim.claimed "quest-2" "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"))
+(free.pco-claim.claim "quest-2"
+  "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"
+  (read-keyset 'alice-ks) "pco-quest-2")
+(expect "alice now holds both rounds' awards" 200.0
+  (free.pco.get-balance "k:a11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11cea11c"))
+(expect "quest-2 code does not open genesis" true
+  (= 100.0 (at 'claimed (free.pco-claim.get-round "genesis"))))
+(free.pco-claim.claim "genesis"
+  "k:b0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb"
+  (read-keyset 'bob-ks) "pco-quest-1")
+(expect "bob funded from genesis" 100.0
+  (free.pco.get-balance "k:b0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb0bb"))
+(expect "meter carries both budgets" 32500.0 (free.pco-claim.ops-epoch-spent))
+(commit-tx)
+
+(begin-tx "per-round codes are isolated: the quest-2 code fails on genesis")
+(expect-failure "codes are per round" "wrong engagement code"
+  (free.pco-claim.claim "genesis"
+    "k:ca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51"
+    (read-keyset 'carla-ks) "pco-quest-2"))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; Code rotation (per round)
+;; ---------------------------------------------------------------------------
+;; The code may be rotated ONLY before a round's first claim (leaked-code
+;; incident response). Once claims have started the code is frozen, so ops can
+;; never redirect a budget the community is already drawing on. Use a fresh,
+;; unclaimed round to exercise the legitimate rotation.
+(begin-tx "rotation invalidates the old code (gov pair WITHOUT the ops key = fallback)")
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "rotate-me" (hash "rot-code-1") 100.0 1000.0
+  (time "2026-08-01T00:00:00Z") (time "2026-08-15T00:00:00Z"))
+(env-keys ["ledger-b", "ledger-c"])
+(free.pco-claim.set-round-code "rotate-me" (hash "rot-code-2"))
+(env-keys [])
+(expect-failure "old code dead" "wrong engagement code"
+  (free.pco-claim.claim "rotate-me"
+    "k:ca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51"
+    (read-keyset 'carla-ks) "rot-code-1"))
+(free.pco-claim.claim "rotate-me"
+  "k:ca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51"
+  (read-keyset 'carla-ks) "rot-code-2")
+(expect "the new code pays" 100.0
+  (free.pco.get-balance
+    "k:ca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51"))
+(commit-tx)
+
+;; NEGATIVE: the same rotation on a round that HAS claims is refused. This is
+;; the ops-misappropriation vector - re-pointing a live round's code hands its
+;; remaining budget to accounts ops controls, and the daily meter cannot bound
+;; it because create-round charged that budget on an earlier day.
+;; NOTE: a fresh transaction - the claim above installed a managed capability,
+;; which poisons every later keyset check in the same tx (platform trap).
+(begin-tx "code is frozen once a round has claims")
+(env-keys ["ledger-a"])
+(expect-failure "code is frozen once a round has claims"
+  "cannot rotate the code once the round has claims"
+  (free.pco-claim.set-round-code "rotate-me" (hash "rot-code-3")))
+(expect-failure "the genesis round is likewise frozen"
+  "cannot rotate the code once the round has claims"
+  (free.pco-claim.set-round-code "genesis" (hash "pco-quest-1b")))
+(commit-tx)
+
+;; a no-op rotation is refused too, so CODE-SET always means a real change
+(begin-tx "a no-op code rotation is refused")
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "rotate-noop" (hash "same-code") 100.0 200.0
+  (time "2026-08-01T00:00:00Z") (time "2026-08-15T00:00:00Z"))
+(expect-failure "rotating to the identical hash is refused"
+  "code hash unchanged"
+  (free.pco-claim.set-round-code "rotate-noop" (hash "same-code")))
+;; genesis keeps its ORIGINAL code (it has claims, so it can never be rotated).
+;; Carla claims it too: a second claim by the same account in a DIFFERENT round
+;; is the v2 behaviour, and it stacks on her rotate-me payout.
+(free.pco-claim.claim "genesis"
+  "k:ca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51"
+  (read-keyset 'carla-ks) "pco-quest-1")
+(expect "carla now holds both round payouts" 200.0
+  (free.pco.get-balance "k:ca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51aca51"))
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; Round window + budget + active switch
+;; ---------------------------------------------------------------------------
+(begin-tx "budget exhaustion at the exact boundary")
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "tiny" (hash "tiny-code") 100.0 100.0
+  (time "2026-08-01T00:00:00Z") (time "2026-08-31T00:00:00Z"))
+(env-keys [])
+(free.pco-claim.claim "tiny"
+  "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+  (read-keyset 'dana-ks) "tiny-code")
+(expect "tiny round fully claimed" 100.0 (at 'claimed (free.pco-claim.get-round "tiny")))
+(expect-failure "budget exhausted for the next claimant" "round budget exhausted"
+  (free.pco-claim.claim "tiny"
+    "k:e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"
+    (read-keyset 'erin-ks) "tiny-code"))
+(commit-tx)
+
+(begin-tx "a paused round refuses claims; reactivation restores the (exhausted) state")
+(env-keys ["ledger-a"])
+(free.pco-claim.set-round-active "tiny" false)
+(env-keys [])
+(expect-failure "inactive round" "round is not active"
+  (free.pco-claim.claim "tiny"
+    "k:e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"
+    (read-keyset 'erin-ks) "tiny-code"))
+(env-keys ["ledger-a"])
+(free.pco-claim.set-round-active "tiny" true)
+(env-keys [])
+(expect-failure "reactivated but still budget-exhausted" "round budget exhausted"
+  (free.pco-claim.claim "tiny"
+    "k:e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"
+    (read-keyset 'erin-ks) "tiny-code"))
+(rollback-tx)
+
+(begin-tx "pause/reactivate on a missing round fails cleanly")
+(env-keys ["ledger-a"])
+(expect-failure "no such round to pause" "No row found during update in table"
+  (free.pco-claim.set-round-active "ghost" false))
+(rollback-tx)
+
+(begin-tx "a future round refuses early claims")
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "future" (hash "future-code") 100.0 2500.0
+  (time "2026-09-01T00:00:00Z") (time "2026-09-15T00:00:00Z"))
+(env-keys [])
+(expect-failure "not yet open" "round has not opened yet"
+  (free.pco-claim.claim "future"
+    "k:e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"
+    (read-keyset 'erin-ks) "future-code"))
+(rollback-tx)
+
+(begin-tx "a round expires IN-CONTRACT at its close time (no ops action)")
+(env-chain-data { "block-time": (time "2026-08-15T00:00:00Z") })   ; quest-2 closes
+(expect-failure "closes boundary is exclusive" "round has closed"
+  (free.pco-claim.claim "quest-2"
+    "k:e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"
+    (read-keyset 'erin-ks) "pco-quest-2"))
+(env-chain-data { "block-time": (time "2026-08-14T23:59:59Z") })   ; one second earlier
+(free.pco-claim.claim "quest-2"
+  "k:e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"
+  (read-keyset 'erin-ks) "pco-quest-2")
+(expect "erin claimed one second before close" 100.0
+  (free.pco.get-balance "k:e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"))
+(rollback-tx)
+(env-chain-data { "block-time": (time "2026-08-01T00:00:00Z") })
+
+;; ---------------------------------------------------------------------------
+;; Grants (judged awards)
+;; ---------------------------------------------------------------------------
+(begin-tx "grant: ops key solo, public reason; balance + meter move")
+(env-keys ["ledger-a"])
+(expect "granted" "granted"
+  (free.pco-claim.grant
+    "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+    (read-keyset 'dana-ks) 250.0
+    "github.com/Pact-Community-Organization/pact-contract-catalog#42 merged"))
+(expect "dana holds claim + grant" 350.0
+  (free.pco.get-balance "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"))
+(expect "meter carries budgets + grant" 34050.0 (free.pco-claim.ops-epoch-spent))
+(commit-tx)
+
+(begin-tx "grant: governance fallback works; frank funded")
+(env-keys ["ledger-b", "ledger-c"])
+(free.pco-claim.grant
+  "k:facefacefacefacefacefacefacefacefacefacefacefacefacefacefaceface"
+  (read-keyset 'frank-ks) 100.0 "docs fix, September micro-recognition batch")
+(expect "frank funded" 100.0
+  (free.pco.get-balance "k:facefacefacefacefacefacefacefacefacefacefacefacefacefacefaceface"))
+(commit-tx)
+
+(begin-tx "grants are independent of the master claim switch")
+(env-keys ["ledger-a"])
+(free.pco-claim.set-open false)
+(free.pco-claim.grant
+  "k:facefacefacefacefacefacefacefacefacefacefacefacefacefacefaceface"
+  (read-keyset 'frank-ks) 50.0 "works while claims are paused")
+(expect "grant landed while claims closed" 150.0
+  (free.pco.get-balance "k:facefacefacefacefacefacefacefacefacefacefacefacefacefacefaceface"))
+(commit-tx)
+
+;; reopen in a SEPARATE tx: a grant's in-code install-capability poisons all
+;; later keyset enforcement in the same tx (see the autonomy regression below)
+(begin-tx "reopen the master switch (own tx - one op per tx after a grant)")
+(env-keys ["ledger-a"])
+(free.pco-claim.set-open true)
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; PLATFORM REGRESSION (REPL-verified 5.4): installing a managed capability
+;; from code (grant's pco.TRANSFER install) makes EVERY later keyset
+;; enforcement in the SAME tx fail - scoped and unscoped signatures alike.
+;; Operational rule: one keyset-gated call per tx after any grant; batches
+;; go through grant-batch (single OPS acquisition, no re-enforcement).
+;; ---------------------------------------------------------------------------
+(begin-tx "autonomy: a second grant in the same tx fails even for the ops key")
+(env-keys ["ledger-a"])
+(free.pco-claim.grant
+  "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+  (read-keyset 'dana-ks) 10.0 "first grant in the tx")
+(expect-failure "post-install keyset checks are poisoned" "ops authorization failed"
+  (free.pco-claim.grant
+    "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+    (read-keyset 'dana-ks) 10.0 "second grant, same tx"))
+(expect-failure "even set-open is poisoned after the install" "ops authorization failed"
+  (free.pco-claim.set-open true))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; grant-batch: several awards under ONE signature (the monthly batch shape)
+;; ---------------------------------------------------------------------------
+(begin-tx "grant-batch: two distinct receivers, one ops signature")
+(env-keys ["ledger-a"])
+(free.pco-claim.grant-batch
+  [ { "account": "k:e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"
+    , "guard": (read-keyset 'erin-ks), "amount": 30.0, "reason": "batch item 1" }
+  , { "account": "k:facefacefacefacefacefacefacefacefacefacefacefacefacefacefaceface"
+    , "guard": (read-keyset 'frank-ks), "amount": 20.0, "reason": "batch item 2" } ])
+(expect "erin funded by the batch" 30.0
+  (free.pco.get-balance "k:e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"))
+(expect "frank topped up by the batch" 170.0
+  (free.pco.get-balance "k:facefacefacefacefacefacefacefacefacefacefacefacefacefacefaceface"))
+(commit-tx)
+
+(begin-tx "grant-batch: the same receiver twice fails (install identity ignores amount)")
+(env-keys ["ledger-a"])
+(expect-failure "duplicate receiver in one batch" "already installed"
+  (free.pco-claim.grant-batch
+    [ { "account": "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+      , "guard": (read-keyset 'dana-ks), "amount": 10.0, "reason": "dup 1" }
+    , { "account": "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+      , "guard": (read-keyset 'dana-ks), "amount": 20.0, "reason": "dup 2" } ]))
+(rollback-tx)
+
+(begin-tx "grant-batch: size bounds")
+(env-keys ["ledger-a"])
+(expect-failure "empty batch" "batch size must be 1-20"
+  (free.pco-claim.grant-batch []))
+(expect-failure "oversized batch" "batch size must be 1-20"
+  (free.pco-claim.grant-batch
+    (make-list 21
+      { "account": "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+      , "guard": (read-keyset 'dana-ks), "amount": 1.0, "reason": "x" })))
+(rollback-tx)
+
+(begin-tx "grant-batch: atomic - one bad item aborts the whole batch")
+(env-keys ["ledger-a"])
+(expect-failure "over-bound item kills the batch" "exceeds the per-grant bound"
+  (free.pco-claim.grant-batch
+    [ { "account": "k:e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"
+      , "guard": (read-keyset 'erin-ks), "amount": 10.0, "reason": "fine" }
+    , { "account": "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+      , "guard": (read-keyset 'dana-ks), "amount": 2500.0, "reason": "too big" } ]))
+(rollback-tx)
+
+(begin-tx "grant negatives: non-ops key, bounds, reason, principal, hub")
+(env-keys ["ledger-b"])
+(expect-failure "single non-ops key cannot grant" "ops authorization failed"
+  (free.pco-claim.grant
+    "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+    (read-keyset 'dana-ks) 1.0 "x"))
+(env-keys ["ledger-a"])
+(expect-failure "grant above MAX-GRANT" "exceeds the per-grant bound"
+  (free.pco-claim.grant
+    "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+    (read-keyset 'dana-ks) 2000.000000000001 "x"))
+(expect-failure "zero grant" "amount must be positive"
+  (free.pco-claim.grant
+    "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+    (read-keyset 'dana-ks) 0.0 "x"))
+(expect-failure "over-precise grant" "respect the token's precision"
+  (free.pco-claim.grant
+    "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+    (read-keyset 'dana-ks) 1.0000000000001 "x"))
+(expect-failure "empty reason" "a public reason is required"
+  (free.pco-claim.grant
+    "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+    (read-keyset 'dana-ks) 1.0 ""))
+(expect-failure "vanity receiver" "principal of its guard"
+  (free.pco-claim.grant "dana" (read-keyset 'dana-ks) 1.0 "x"))
+(env-chain-data { "chain-id": "3" })
+(expect-failure "grants are hub-only" "hub chain only"
+  (free.pco-claim.grant
+    "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+    (read-keyset 'dana-ks) 1.0 "x"))
+(rollback-tx)
+(env-chain-data { "chain-id": "0" })
+
+;; ---------------------------------------------------------------------------
+;; The daily ops meter: exact cap boundary + epoch roll
+;; ---------------------------------------------------------------------------
+(begin-tx "ops meter: == cap passes, +epsilon fails (fresh epoch)")
+(env-chain-data { "block-time": (time "2026-08-02T00:00:00Z") })   ; +1 day: epoch rolls
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "met1" (hash "met1") 500.0 30000.0
+  (time "2026-08-02T00:00:00Z") (time "2026-08-09T00:00:00Z"))
+(expect "fresh epoch: only m1 counted" 30000.0 (free.pco-claim.ops-epoch-spent))
+(free.pco-claim.create-round "met2" (hash "met2") 500.0 10000.0
+  (time "2026-08-02T00:00:00Z") (time "2026-08-09T00:00:00Z"))
+(expect "exactly at the cap is allowed" 40000.0 (free.pco-claim.ops-epoch-spent))
+(expect-failure "one more grant breaks the daily cap" "ops daily cap reached"
+  (free.pco-claim.grant
+    "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+    (read-keyset 'dana-ks) 0.000000000001 "epsilon over the cap"))
+(rollback-tx)
+
+(begin-tx "ops meter: the READ self-heals across the epoch boundary")
+(env-chain-data { "block-time": (time "2026-08-02T00:00:00Z") })
+(expect "yesterday's commitments no longer count" 0.0 (free.pco-claim.ops-epoch-spent))
+(rollback-tx)
+
+(begin-tx "ops meter: one second BEFORE the boundary does NOT roll (fencepost)")
+(env-chain-data { "block-time": (time "2026-08-01T23:59:59Z") })   ; epoch-start + 86399s
+(expect "prior commitments still count at 86399s" 34250.0 (free.pco-claim.ops-epoch-spent))
+(env-keys ["ledger-a"])
+(free.pco-claim.grant
+  "k:dadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadada"
+  (read-keyset 'dana-ks) 1.0 "fencepost probe")
+(expect "a sub-boundary charge ACCUMULATES (no reset)" 34251.0 (free.pco-claim.ops-epoch-spent))
+(rollback-tx)
+
+;; The cap firing MID-BATCH aborts the whole batch: on-chain the tx abort IS
+;; the atomicity (REPL expect-failure leaves partial writes, hence rollback).
+(begin-tx "ops meter: cap crossing on a LATER batch item kills the whole batch")
+(env-chain-data { "block-time": (time "2026-08-02T00:00:00Z") })   ; fresh epoch
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "capm1" (hash "capm1") 500.0 30000.0
+  (time "2026-08-02T00:00:00Z") (time "2026-08-09T00:00:00Z"))
+(free.pco-claim.create-round "capm2" (hash "capm2") 500.0 9900.0
+  (time "2026-08-02T00:00:00Z") (time "2026-08-09T00:00:00Z"))
+(expect "39900 committed" 39900.0 (free.pco-claim.ops-epoch-spent))
+(expect-failure "item 2 crosses the cap - whole batch fails" "ops daily cap reached"
+  (free.pco-claim.grant-batch
+    [ { "account": "k:e51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51ee51e"
+      , "guard": (read-keyset 'erin-ks), "amount": 60.0, "reason": "fits" }
+    , { "account": "k:facefacefacefacefacefacefacefacefacefacefacefacefacefacefaceface"
+      , "guard": (read-keyset 'frank-ks), "amount": 60.0, "reason": "crosses" } ]))
+(rollback-tx)
+
+(begin-tx "charge-ops-meter is internal: bare call refused")
+(env-keys ["ledger-a"])
+(expect-failure "meter charge needs an acquired OPS" "require-capability: not granted"
+  (free.pco-claim.charge-ops-meter 1.0))
+(rollback-tx)
+(env-chain-data { "block-time": (time "2026-08-01T00:00:00Z") })
+
+;; ---------------------------------------------------------------------------
+;; Pool escrow integrity: nobody OUTSIDE pco-claim can debit the pool.
+;; The pool account is guarded by a MODULE GUARD of pco-claim (module guard), so a
+;; direct pco.transfer-create on the pool from outside falls through to
+;; acquireModuleAdmin(pco-claim) -> pco-claim's governance keyset (keys-2).
+;; This is what keeps the pool safe from a foreign module that has obtained one
+;; of our capabilities by any route: holding a capability is not enough here,
+;; because the module guard falls through to the governance keyset, and no
+;; outside caller can satisfy that.
+;; ---------------------------------------------------------------------------
+(begin-tx "pool cannot be debited by an outsider (module guard holds)")
+(env-sigs [ { "key": "attacker-key"
+            , "caps": [(free.pco.TRANSFER (free.pco-claim.pool-account) "alice" 1.0)] } ])
+(expect-failure "module guard: outsider cannot spend the pool" "Keyset failure"
+  (free.pco.transfer-create (free.pco-claim.pool-account)
+    "alice" (read-keyset 'attacker) 1.0))
+(rollback-tx)
+
+(begin-tx "an INSUFFICIENT gov keyset (1 of keys-2) still cannot debit the pool")
+(env-sigs [ { "key": "ledger-a", "caps": [(free.pco.TRANSFER (free.pco-claim.pool-account) "alice" 1.0)] } ])
+(expect-failure "module admin needs the full keys-2 quorum" "Keyset failure"
+  (free.pco.transfer-create (free.pco-claim.pool-account)
+    "alice" (read-keyset 'attacker) 1.0))
+(rollback-tx)
+
+;; DISCLOSED POWER (crosses no tier): the FULL governance keyset (keys-2) satisfies
+;; pco-claim's module admin, so it CAN spend the pool via a raw transfer. This is
+;; equivalent to what governance already does through sweep-pool (and it can upgrade
+;; the module besides); the only difference is a raw drain skips sweep-pool's
+;; close-first precondition and the SWEPT event. Same trust tier, disclosed here.
+(begin-tx "the full governance keyset CAN spend the pool (module admin; disclosed)")
+(env-sigs [ { "key": "ledger-a", "caps": [(free.pco.TRANSFER (free.pco-claim.pool-account) "alice" 1.0)] }
+          , { "key": "ledger-b", "caps": [(free.pco.TRANSFER (free.pco-claim.pool-account) "alice" 1.0)] } ])
+(expect "governance may spend the pool directly (crosses no tier)" "Write succeeded"
+  (free.pco.transfer-create (free.pco-claim.pool-account)
+    "alice" (read-keyset 'attacker) 1.0))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; Sweep: only after close, only admin, lands on the receiver
+;; ---------------------------------------------------------------------------
+;; OPS ROTATION — governance-owned, always available
+;; The ops authority is module state in `pco`, not a named keyset, so the
+;; old fragility is gone by construction: ops cannot rotate itself, and a
+;; governance pair can replace it WITHOUT the outgoing device's cooperation
+;; (proved in the setup section). Here we re-prove the operational tail:
+;; after rotation the old key is powerless and the new one operates, with
+;; the governance fallback intact throughout.
+;; ---------------------------------------------------------------------------
+(begin-tx "gov rotates ops without the outgoing key; old powerless, new operates")
+(env-data { "new-ops": { "keys": ["ledger-x"], "pred": "keys-all" } })
+(env-keys ["ledger-b", "ledger-c"])          ; a quorum that EXCLUDES ops (ledger-a)
+(expect "governance re-points ops with no upgrade" "ops guard set"
+  (free.pco.set-ops-guard (read-keyset 'new-ops)))
+(env-keys ["ledger-a"])
+(expect-failure "rotated-out ops key is powerless for OPS" "ops authorization failed"
+  (free.pco-claim.set-round-code "genesis" (hash "post-rotation-code")))
+(env-keys ["ledger-x"])
+;; genesis has claims, so its CODE is frozen by design; use another OPS-tier
+;; call to prove the rotated-in authority operates.
+(expect "the rotated-in ops key operates" "round activated"
+  (free.pco-claim.set-round-active "genesis" true))
+(env-keys ["ledger-b", "ledger-c"])
+(expect "governance fallback survives the ops rotation" "round activated"
+  (free.pco-claim.set-round-active "genesis" true))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; C9 — the epoch roll is ELAPSED TIME, not the calendar date.
+;;
+;; A mutant that replaced `(>= (diff-time now es) 86400)` with a calendar-date
+;; comparison survived all 16 checks, because EVERY block-time in the suite was
+;; midnight-aligned - and at midnight "a different date" and "86,400 seconds
+;; later" are the same instant, so the two rules are indistinguishable.
+;;
+;; They are not the same rule. A calendar roll gives the ops tier a fresh daily
+;; cap at every midnight, so committing the cap at 23:59 and again at 00:01
+;; spends two days' worth of budget in two minutes. The elapsed rule is what
+;; makes OPS-EPOCH-CAP an actual rate limit.
+;;
+;; This anchors the epoch OFF midnight, which is the only way to tell them apart.
+;; ---------------------------------------------------------------------------
+(begin-tx "C9: the epoch anchors off-midnight and rolls on ELAPSED time")
+;; 18:00, deliberately not midnight. This charge sets epoch-start.
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-05T18:00:00Z") })
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "c9-a" (hash "c9-a") 100.0 30000.0
+  (time "2026-08-05T18:00:00Z") (time "2026-09-05T00:00:00Z"))
+(expect "the 18:00 commitment anchored the epoch" 30000.0
+  (free.pco-claim.ops-epoch-spent))
+
+;; 06:00 the NEXT DAY: a different calendar date, but only 12 hours elapsed.
+;; The cap must still bite - 30,000 + 30,000 exceeds OPS-EPOCH-CAP (40,000).
+;; Under a calendar-date roll the meter would reset to 0 here and this would
+;; SUCCEED, which is exactly the mutant this kills.
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-06T06:00:00Z") })
+(expect "12 hours later is still the same epoch, despite the date changing" 30000.0
+  (free.pco-claim.ops-epoch-spent))
+(expect-failure "the cap still bites across midnight - the epoch did NOT roll"
+  "ops daily cap reached"
+  (free.pco-claim.create-round "c9-b" (hash "c9-b") 100.0 30000.0
+    (time "2026-08-06T06:00:00Z") (time "2026-09-06T00:00:00Z")))
+(rollback-tx)
+
+(begin-tx "C9b: and it DOES roll once a full 86,400s has elapsed")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-05T18:00:00Z") })
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "c9-c" (hash "c9-c") 100.0 30000.0
+  (time "2026-08-05T18:00:00Z") (time "2026-09-05T00:00:00Z"))
+;; 18:00 the next day = exactly 86,400s later. Positive control: without this,
+;; a mutant that NEVER rolls would also pass the assertion above.
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-06T18:00:00Z") })
+(expect "a full day elapsed, so the epoch rolled" 0.0
+  (free.pco-claim.ops-epoch-spent))
+(expect "and the ops tier has its full cap again" "round c9-d created"
+  (free.pco-claim.create-round "c9-d" (hash "c9-d") 100.0 30000.0
+    (time "2026-08-06T18:00:00Z") (time "2026-09-06T00:00:00Z")))
+(rollback-tx)
+
+(print "pco-claim.repl: ALL TESTS PASSED")

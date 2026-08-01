@@ -1,0 +1,276 @@
+;; ops-recovery.repl — the ops tier is ALWAYS recoverable.
+;;
+;; The routine-ops authority is governance-owned module state (pco.ops-auth),
+;; not a named keyset. This suite proves the three properties that follow, the
+;; last of which is the whole reason for the design:
+;;   1. the ops authority can never re-point itself;
+;;   2. ANY governance quorum can replace it — including one that EXCLUDES the
+;;      outgoing device, so a lost or compromised ops key is recoverable;
+;;   3. recovery survives FROZEN-MODULE, because OPS-ADMIN is gated on the
+;;      community keyset alone and deliberately NOT on the freeze flag.
+;; (Freezing `pco` re-pins its dependents, so pco-claim is redeployed below —
+;; that is the standing post-upgrade rule, not a property of this design.)
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+;; ---------------------------------------------------------------------------
+;; Setup: interfaces + namespace + keyset + token + claim + mint
+;; ---------------------------------------------------------------------------
+(begin-tx "interfaces + coin (pco references coin.VALID_CHAIN_IDS)")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "deploy")
+(env-data
+  { "ns": "free"
+  , "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "gov-threshold": 0.001
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "pco-ops": { "keys": ["ledger-a"], "pred": "keys-all" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+;; NOTE: there is no `pco-ops` KEYSET any more. The ops authority is module
+;; state in `pco`, named by governance — so there is no undefined-keyset
+;; failure mode to defend against, and no keyset the ops device can hijack.
+(load "../contracts/pco.pact")
+(load "../contracts/pco-claim.pact")
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; OPS AUTHORITY: governance-owned, always recoverable
+;; ---------------------------------------------------------------------------
+(begin-tx "before any set: ops defaults to governance, so nothing is stranded")
+(env-keys ["ledger-a", "ledger-b"])
+(expect "a governance pair operates immediately on a fresh deploy" "claims open"
+  (free.pco-claim.set-open true))
+(rollback-tx)
+
+(begin-tx "before any set: a lone ops candidate has NO authority yet")
+(env-keys ["ledger-a"])
+(expect-failure "ledger-a alone cannot operate until governance names it"
+  "ops authorization failed"
+  (free.pco-claim.set-open true))
+(rollback-tx)
+
+(begin-tx "governance names the ops authority (1-of-2 over the active devices)")
+(env-data { "ops-authority": { "keys": ["ledger-a", "ledger-b"], "pred": "keys-any" } })
+(env-keys ["ledger-a", "ledger-b"])
+(expect "governance sets the ops guard" "ops guard set"
+  (free.pco.set-ops-guard (read-keyset 'ops-authority)))
+(commit-tx)
+
+(begin-tx "the named authority now operates SOLO, on both modules")
+(env-keys ["ledger-a"])
+(expect "ops solo runs claim ops" "claims open" (free.pco-claim.set-open true))
+(expect "ops solo authors a governance question" "1"
+  (free.pco.create-proposal "ops-tier reachable" "b" ["a" "b"] 72))
+(rollback-tx)
+
+(begin-tx "1-of-2: the OTHER device operates too, so one lost device never halts ops")
+(env-keys ["ledger-b"])
+(expect "the second device operates solo" "claims open" (free.pco-claim.set-open true))
+(rollback-tx)
+
+(begin-tx "ops CANNOT re-point itself — the hijack path is closed by construction")
+(env-data { "hijack": { "keys": ["attacker"], "pred": "keys-all" } })
+(env-keys ["ledger-a"])
+(expect-failure "the ops authority cannot name its successor" "Keyset failure"
+  (free.pco.set-ops-guard (read-keyset 'hijack)))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; GUARD-TYPE ALLOWLIST — only a LITERAL keyset may hold the ops authority.
+;; Governance holds this pen, so the danger is not theft but self-injury: a
+;; guard that ABORTS at authorization time silently freezes routine ops, and
+;; the abort is a lookup/eval error that enforce-one cannot fall through.
+;; ---------------------------------------------------------------------------
+(begin-tx "REJECT r: — a keyset REFERENCE (undefined name = every ops call dies)")
+(env-data { "dangling": { "keysetref": { "ksn": "free.ghost" } } })
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "a dangling keyset-ref is refused at write time, not at use time"
+  "ops authority must be a plain keyset guard, not r:"
+  (free.pco.set-ops-guard (read-msg 'dangling)))
+(rollback-tx)
+
+(begin-tx "REJECT r: — even a keyset-ref that RESOLVES today (redefinition-hijack surface)")
+(env-data { "live-ref": { "keysetref": { "ksn": "free.pco-gov" } } })
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "a resolvable ref is refused too: the NAME could be redefined later"
+  "ops authority must be a plain keyset guard, not r:"
+  (free.pco.set-ops-guard (read-msg 'live-ref)))
+(rollback-tx)
+
+(begin-tx "REJECT c: — a capability guard is not satisfiable by any signer")
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "a capability guard is refused"
+  "ops authority must be a plain keyset guard, not c:"
+  (free.pco.set-ops-guard (create-capability-guard (free.pco.GOVERNANCE))))
+(rollback-tx)
+
+(begin-tx "REJECT empty keyset — keys-all over ZERO keys is VACUOUSLY TRUE")
+;; The one shape that fails OPEN: it would hand create-round / set-open / the
+;; bounded grant path to a caller signing nothing at all.
+(env-data { "mt-all": { "keys": [], "pred": "keys-all" }
+          , "mt-any": { "keys": [], "pred": "keys-any" }
+          , "mt-2":   { "keys": [], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "empty keys-all (the dangerous one) refused"
+  "ops keyset must not be empty" (free.pco.set-ops-guard (read-keyset 'mt-all)))
+(expect-failure "empty keys-any refused too (would brick ops, not open it)"
+  "ops keyset must not be empty" (free.pco.set-ops-guard (read-keyset 'mt-any)))
+(expect-failure "empty keys-2 refused too"
+  "ops keyset must not be empty" (free.pco.set-ops-guard (read-keyset 'mt-2)))
+(rollback-tx)
+
+(begin-tx "REJECT custom predicate — module code at authorization time")
+;; A keyset may name its own predicate function; that re-introduces exactly
+;; what user guards are refused for, and can be wide open OR abort-prone.
+(env-data { "cp": { "keys": ["368820f80c324bbc7c2b0610688a7da43e39f91d118732671cd9c7500ff43cca"]
+                  , "pred": "free.evil.open-pred" }
+          ;; The IMPERSONATOR: a module function named after the builtin. The
+          ;; suffix check matches on ":keys-all" WITH THE LEADING COLON, and
+          ;; that colon is the whole defence - create-principal emits it only
+          ;; as its own separator, and read-keyset refuses a colon inside a
+          ;; predicate, so ".keys-all" can never be mistaken for ":keys-all".
+          ;; Drop the colon from the check and this keyset is accepted, after
+          ;; which a total stranger runs the ops tier.
+          , "imp": { "keys": ["368820f80c324bbc7c2b0610688a7da43e39f91d118732671cd9c7500ff43cca"]
+                   , "pred": "free.evil.keys-all" }
+          , "imp2": { "keys": ["368820f80c324bbc7c2b0610688a7da43e39f91d118732671cd9c7500ff43cca"]
+                    , "pred": "free.evil.keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "a custom predicate is refused"
+  "ops keyset must use a builtin predicate"
+  (free.pco.set-ops-guard (read-keyset 'cp)))
+(expect "the impersonator's principal ends in .keys-all, NOT :keys-all" ".keys-all"
+  (take -9 (create-principal (read-keyset 'imp))))
+(expect-failure "a predicate FUNCTION NAMED keys-all is refused"
+  "ops keyset must use a builtin predicate"
+  (free.pco.set-ops-guard (read-keyset 'imp)))
+(expect-failure "a predicate function named keys-2 is refused"
+  "ops keyset must use a builtin predicate"
+  (free.pco.set-ops-guard (read-keyset 'imp2)))
+(rollback-tx)
+
+(begin-tx "ACCEPT: the literal keyset shapes, k: (1 real key) and w: (n keys)")
+;; NOTE: the k: principal form requires a REAL 64-hex ed25519 key under
+;; keys-all — a symbolic REPL name like "ledger-a" yields a w: principal, so
+;; a test written with one would silently never exercise the k: branch.
+(env-data { "one":  { "keys": ["368820f80c324bbc7c2b0610688a7da43e39f91d118732671cd9c7500ff43cca"]
+                    , "pred": "keys-all" }
+          , "many": { "keys": ["ledger-a", "ledger-b"], "pred": "keys-any" }
+          , "two":  { "keys": ["ledger-a", "ledger-b"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(expect "k: principal — real single key, keys-all" "k:368820f80c324bbc7c2b0610688a7da43e39f91d118732671cd9c7500ff43cca"
+  (create-principal (read-keyset 'one)))
+(expect "single-key keyset (k: principal) accepted" "ops guard set"
+  (free.pco.set-ops-guard (read-keyset 'one)))
+(expect "multi-key keys-any (w: principal) accepted" "ops guard set"
+  (free.pco.set-ops-guard (read-keyset 'many)))
+(expect "keys-2 (w: principal) accepted" "ops guard set"
+  (free.pco.set-ops-guard (read-keyset 'two)))
+(rollback-tx)
+
+(begin-tx "ALWAYS RECOVERABLE: a gov pair WITHOUT the old ops device replaces it")
+;; ledger-a is 'lost' (or compromised): the quorum b+c never touches it
+(env-data { "ops-v2": { "keys": ["ledger-b"], "pred": "keys-all" } })
+(env-keys ["ledger-b", "ledger-c"])
+(expect "b+c re-point ops with no upgrade and no cooperation from a" "ops guard set"
+  (free.pco.set-ops-guard (read-keyset 'ops-v2)))
+(env-keys ["ledger-a"])
+(expect-failure "the replaced device has no authority left" "ops authorization failed"
+  (free.pco-claim.set-open true))
+(env-keys ["ledger-b"])
+(expect "the new authority operates" "claims open" (free.pco-claim.set-open true))
+(rollback-tx)
+
+(begin-tx "fixture: ops authority = ledger-a alone for the rest of the suite")
+(env-data { "ops-authority": { "keys": ["ledger-a"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco.set-ops-guard (read-keyset 'ops-authority))
+(commit-tx)
+
+
+(begin-tx "1. the ops authority cannot re-point itself")
+(env-data { "grab": { "keys": ["ledger-a"], "pred": "keys-all" } })
+(env-keys ["ledger-a"])
+(expect-failure "ops cannot name its successor" "Keyset failure"
+  (free.pco.set-ops-guard (read-keyset 'grab)))
+(rollback-tx)
+
+(begin-tx "2. a gov quorum EXCLUDING the outgoing device replaces the authority")
+(env-data { "ops-v2": { "keys": ["ledger-x"], "pred": "keys-all" } })
+(env-keys ["ledger-b", "ledger-c"])
+(expect "recovery without the outgoing device" "ops guard set"
+  (free.pco.set-ops-guard (read-keyset 'ops-v2)))
+(env-keys ["ledger-a"])
+(expect-failure "the replaced authority is powerless" "ops authorization failed"
+  (free.pco-claim.set-open true))
+(env-keys ["ledger-x"])
+(expect "the new authority operates" "claims open" (free.pco-claim.set-open true))
+(rollback-tx)
+
+;; --- 3. recovery survives a permanent freeze -------------------------------
+(begin-tx "freeze pco (FROZEN-MODULE = true)")
+(env-data { "ns": "free", "upgrade": true
+          , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0 })
+(env-keys ["ledger-a", "ledger-b"])
+(namespace "free")
+(load "fixtures/frozen-pco.pact")
+(commit-tx)
+
+(begin-tx "dependents re-pin after the upgrade (standing rule)")
+(env-data { "ns": "free", "upgrade": true
+          , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0 })
+(env-keys ["ledger-a", "ledger-b"])
+(load "../contracts/pco-claim.pact")
+(commit-tx)
+
+(begin-tx "3. governance can STILL re-point ops on a frozen module")
+(env-data { "ops-frozen": { "keys": ["ledger-x"], "pred": "keys-all" } })
+(env-keys ["ledger-b", "ledger-c"])
+(expect "ops recovery survives the freeze" "ops guard set"
+  (free.pco.set-ops-guard (read-keyset 'ops-frozen)))
+(env-keys ["ledger-x"])
+(expect "the newly named authority operates on a frozen module" "claims open"
+  (free.pco-claim.set-open true))
+(rollback-tx)
+
+;; --- 4. A FREEZE STOPS THE CODE CHANGING, AND NOTHING ELSE -----------------
+;; FROZEN-MODULE is an UPGRADE gate. It must never disable an operation: a
+;; frozen system that cannot pay out, cannot be re-pointed, or cannot release
+;; its funds is a system that has trapped them. Every case below runs against
+;; the FROZEN pco loaded above.
+;; GAP, recorded rather than papered over: this suite never mints, so the FUNDED
+;; post-freeze paths - transfer, vote, claim, sweep - are NOT proven anywhere
+;; yet. They are the ones that would actually trap value if a freeze disabled
+;; them. Needs a funded frozen-pair suite.
+(begin-tx "4. a frozen module still registers escrows")
+(env-keys ["ledger-a", "ledger-b"])
+(expect "the non-voting register stays correctable after the freeze"
+  "holder registered as non-voting"
+  (free.pco.register-non-voting "holder" "post-freeze correction"))
+(rollback-tx)
+
+(begin-tx "4. ONLY the code is locked")
+(env-keys ["ledger-a", "ledger-b"])
+;; The governance capability gates BOTH redefinition and module-admin
+;; acquisition, so freezing closes the direct-table-write route as well. That is
+;; inherent to how governance is gated, not a separate switch, and it is the intended
+;; consequence: after the flip nobody - including governance - edits state
+;; behind the functions.
+(expect-failure "module admin is unobtainable once frozen" "Module is frozen"
+  (acquire-module-admin free.pco))
+(rollback-tx)
+
+(print "ops-recovery.repl: ALL TESTS PASSED")

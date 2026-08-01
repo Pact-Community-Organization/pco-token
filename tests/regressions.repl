@@ -1,0 +1,281 @@
+;; regressions.repl — coverage added after the 2026-07-25 external audit.
+;;
+;; Every case here corresponds to a MUTANT THAT SURVIVED the existing suites:
+;; the contract was correct, but a regression in these exact places would have
+;; shipped green. Each block names the mutation it kills.
+;;
+;;   R1  TRANSFER_XCHAIN-mgr bound removed  -> a 1.0 signature moved 900,000
+;;   R2  release-votes stops persisting the shrunk ballot weight -> repeated
+;;       PUBLIC calls drive scores and turnout arbitrarily negative
+;;   R3  MAXIMUM_ACCOUNT_LENGTH raised / its enforce deleted
+;;   R4  create-proposal body bound deleted
+;;
+;; Self-contained: fixtures + a fresh deploy, so it perturbs no other suite.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "namespace + keysets + deploy")
+(env-data
+  { "ns": "free", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "pco-ops": { "keys": ["ledger-a"], "pred": "keys-all" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(commit-tx)
+(begin-tx "governance names the ops authority (replaces the old pco-ops keyset)")
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco.set-ops-guard (read-keyset 'pco-ops))
+(commit-tx)
+
+
+(begin-tx "mint the whole supply to the reserve, then fund test holders")
+(env-data { "alice": { "keys": ["alice-key"], "pred": "keys-all" }
+          , "bob":   { "keys": ["bob-key"],   "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco.init-mint
+  [ { "account": (free.pco.reserve-account)
+    , "guard": (keyset-ref-guard "free.pco-gov"), "amount": 1000000.0 } ])
+(env-sigs
+  [ { "key": "ledger-a", "caps": [(free.pco.TRANSFER "r:free.pco-gov" "alice" 1000.0)
+                                 ,(free.pco.TRANSFER "r:free.pco-gov" "bob" 500.0)] }
+  , { "key": "ledger-b", "caps": [(free.pco.TRANSFER "r:free.pco-gov" "alice" 1000.0)
+                                 ,(free.pco.TRANSFER "r:free.pco-gov" "bob" 500.0)] } ])
+(free.pco.transfer-create "r:free.pco-gov" "alice" (read-keyset 'alice) 1000.0)
+(free.pco.transfer-create "r:free.pco-gov" "bob"   (read-keyset 'bob)   500.0)
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; R1 — TRANSFER_XCHAIN-mgr MUST bound the send to the installed amount.
+;;      Kills: (defun TRANSFER_XCHAIN-mgr (managed requested) 0.0)  [bound removed]
+;;      Without the (>= managed requested) enforce, a signature scoped to a
+;;      trivial amount authorises a send of the sender's ENTIRE balance.
+;; ---------------------------------------------------------------------------
+(begin-tx "R1: a cross-chain signature cannot move more than it installed")
+(env-data { "xr": { "keys": ["cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33"], "pred": "keys-all" } })
+(env-sigs [{ "key": "alice-key"
+           , "caps": [(free.pco.TRANSFER_XCHAIN "alice" "k:cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33" 1.0 "1")] }])
+(expect-failure
+  "R1 a 1.0 cross-chain signature must NOT authorise moving 900.0"
+  "cross-chain transfer exceeds installed amount"
+  (free.pco.transfer-crosschain "alice" "k:cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33" (read-keyset 'xr) "1" 900.0))
+(rollback-tx)
+
+(begin-tx "R1b: the installed amount itself still works (guard is not over-tight)")
+(env-data { "xr": { "keys": ["cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33"], "pred": "keys-all" } })
+(env-sigs [{ "key": "alice-key"
+           , "caps": [(free.pco.TRANSFER_XCHAIN "alice" "k:cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33" 1.0 "1")] }])
+(free.pco.transfer-crosschain "alice" "k:cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33cc33" (read-keyset 'xr) "1" 1.0)
+(expect "R1b the permitted amount left the source chain" 999.0
+  (free.pco.get-balance "alice"))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; R2 — release-votes MUST persist the shrunk ballot weight.
+;;      Kills: dropping (update rcv-ballots vkey { "weight": bal }) from release.
+;;      release-votes is PUBLIC and permissionless, so if the ballot row keeps a
+;;      stale weight, every extra call re-subtracts the same excess and drives
+;;      scores and turnout arbitrarily negative — remotely, by anyone, for free.
+;; ---------------------------------------------------------------------------
+(begin-tx "R2 setup: ops opens a question and alice votes her full balance")
+(env-data { "ns": "free" })
+(env-keys ["ledger-a"])
+(env-sigs [{ "key": "ledger-a", "caps": [] }])
+(free.pco.create-proposal "R2" "regression" ["a" "b"] 720)
+(commit-tx)
+
+(begin-tx "R2: alice votes 1000 on option 0 (K=2 -> 2000 points)")
+(env-keys ["alice-key"]) (env-sigs [{ "key": "alice-key", "caps": [] }])
+(free.pco.cast-vote "1" "alice" [0])
+(commit-tx)
+(expect "R2 baseline scores" [2000.0 0.0] (at 'scores (free.pco.get-results "1")))
+(expect "R2 baseline turnout" 1000.0 (at 'turnout (free.pco.get-results "1")))
+
+(begin-tx "R2: alice moves 400 away, which auto-releases the excess")
+(env-sigs [{ "key": "alice-key", "caps": [(free.pco.TRANSFER "alice" "bob" 400.0)] }])
+(free.pco.transfer "alice" "bob" 400.0)
+(commit-tx)
+;; the ballot must now CARRY the reduced weight, not merely have had its points removed
+(expect "R2 the ballot row records the shrunk weight" 600.0
+  (at 'weight (free.pco.get-ballot "1" "alice")))
+(expect "R2 scores reflect exactly one release" [1200.0 0.0]
+  (at 'scores (free.pco.get-results "1")))
+(expect "R2 turnout reflects exactly one release" 600.0
+  (at 'turnout (free.pco.get-results "1")))
+
+(begin-tx "R2: ANY stranger calls the public release repeatedly — must be inert")
+(env-keys []) (env-sigs [])
+(free.pco.release-votes "alice")
+(free.pco.release-votes "alice")
+(free.pco.release-votes "alice")
+(commit-tx)
+(expect "R2 repeated public release cannot move scores again" [1200.0 0.0]
+  (at 'scores (free.pco.get-results "1")))
+(expect "R2 repeated public release cannot move turnout again" 600.0
+  (at 'turnout (free.pco.get-results "1")))
+(expect "R2 no score went negative"
+  true (fold (and) true (map (lambda (s:decimal) (>= s 0.0))
+                             (at 'scores (free.pco.get-results "1")))))
+
+;; ---------------------------------------------------------------------------
+;; R3 — the account-name MAXIMUM length must be enforced.
+;;      Kills: MAXIMUM_ACCOUNT_LENGTH 256 -> 4096, and deleting the enforce.
+;; ---------------------------------------------------------------------------
+(begin-tx "R3: a 257-character account name is refused")
+(env-data { "long": { "keys": ["long-key"], "pred": "keys-all" } })
+(expect-failure
+  "R3 account names longer than MAXIMUM_ACCOUNT_LENGTH must be refused"
+  "max length requirement"
+  (free.pco.create-account
+    (fold (lambda (a:string i:integer) (+ a "x")) "" (enumerate 1 257))
+    (read-keyset 'long)))
+(rollback-tx)
+
+(begin-tx "R3b: exactly 256 characters is still accepted (boundary, not off-by-one)")
+(env-data { "long": { "keys": ["long-key"], "pred": "keys-all" } })
+(free.pco.create-account
+  (fold (lambda (a:string i:integer) (+ a "x")) "" (enumerate 1 256))
+  (read-keyset 'long))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; R4 — the proposal body bound must be enforced (unbounded body = unbounded
+;;      write cost on a slot every transfer's release path walks).
+;;      Kills: deleting (enforce (<= (length body) 2000) ...).
+;; ---------------------------------------------------------------------------
+(begin-tx "R4: a 2001-character proposal body is refused")
+(env-data { "ns": "free" })
+(env-keys ["ledger-a"])
+(env-sigs [{ "key": "ledger-a", "caps": [] }])
+(expect-failure
+  "R4 proposal bodies over 2000 characters must be refused"
+  "body <= 2000 chars"
+  (free.pco.create-proposal "R4"
+    (fold (lambda (a:string i:integer) (+ a "y")) "" (enumerate 1 2001))
+    ["a" "b"] 720))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; R5 — transfer-crosschain step 0 MUST validate the receiver/guard pair.
+;;      Audit F-8. enforce-reserved is a pure function of (account, guard) and
+;;      both are frozen into the yield, so a mismatched pair fails on the target
+;;      chain deterministically, on every chain, forever — and step 1 has no
+;;      rollback. Without the source-chain check the debit is a SILENT,
+;;      PERMANENT destruction that supply accounting never records.
+;;      Kills: deleting (enforce-reserved receiver receiver-guard) from step 0.
+;; ---------------------------------------------------------------------------
+(begin-tx "R5: a mismatched k: receiver/guard pair is refused BEFORE any debit")
+(env-data
+  { "wrong-guard": { "keys": ["bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff0011223344aa"]
+                   , "pred": "keys-all" } })
+(env-sigs [{ "key": "alice-key"
+           , "caps": [(free.pco.TRANSFER_XCHAIN "alice"
+               "k:aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
+               10.0 "1")] }])
+(expect-failure
+  "R5 a k: receiver paired with a DIFFERENT key's guard must abort on the source chain"
+  "cross-chain receiver must be the principal of its guard"
+  (free.pco.transfer-crosschain "alice"
+    "k:aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
+    (read-keyset 'wrong-guard) "1" 10.0))
+(rollback-tx)
+(expect "R5 nothing was debited — the tokens were not destroyed" 600.0
+  (free.pco.get-balance "alice"))
+
+(begin-tx "R5a: a VANITY (non-principal) cross-chain receiver is refused")
+;; Cold-audit F2: a vanity name's guard is not derivable from the name, so any
+;; observer of the public yield can create that account on the TARGET chain under
+;; their OWN guard before the continuation lands. Credit then dies on "account
+;; guard mismatch" and the debited tokens are destroyed. Principals cannot be
+;; squatted, so cross-chain is restricted to them.
+(env-data { "vanity": { "keys": ["vanity-key"], "pred": "keys-all" } })
+(env-sigs [{ "key": "alice-key"
+           , "caps": [(free.pco.TRANSFER_XCHAIN "alice" "alice-savings" 10.0 "1")] }])
+(expect-failure
+  "R5a a squattable vanity receiver must not be allowed cross-chain"
+  "cross-chain receiver must be the principal of its guard"
+  (free.pco.transfer-crosschain "alice" "alice-savings" (read-keyset 'vanity) "1" 10.0))
+(rollback-tx)
+(expect "R5a nothing was debited" 600.0 (free.pco.get-balance "alice"))
+
+(begin-tx "R5b: the CORRECT pair still works (the check is not over-tight)")
+(env-data
+  { "right-guard": { "keys": ["aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"]
+                   , "pred": "keys-all" } })
+(env-sigs [{ "key": "alice-key"
+           , "caps": [(free.pco.TRANSFER_XCHAIN "alice"
+               "k:aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
+               10.0 "1")] }])
+(free.pco.transfer-crosschain "alice"
+  "k:aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
+  (read-keyset 'right-guard) "1" 10.0)
+(expect "R5b a well-formed cross-chain send still debits normally" 590.0
+  (free.pco.get-balance "alice"))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; R6 — the scoped signature must bind the DESTINATION, not just the account.
+;;      Audit F-12. The new guard travels in tx DATA, which no wallet renders.
+;;      If the capability named only the account, a compromised page could
+;;      install an ATTACKER's key under a signature the user inspected and
+;;      found correct — the Bybit failure mode, with the capability intact.
+;;      Kills: reverting ROTATE/VOTE-KEY-ADMIN to their single-argument form.
+;; ---------------------------------------------------------------------------
+(begin-tx "R6: a ROTATE signature cannot be spent on a DIFFERENT new guard")
+(env-data
+  { "intended": { "keys": ["intended-new-owner"], "pred": "keys-all" }
+  , "attacker": { "keys": ["attacker-key"],       "pred": "keys-all" }
+  , "namedacct": { "keys": ["named-key"],         "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(env-sigs
+  [ { "key": "ledger-a", "caps": [(free.pco.TRANSFER "r:free.pco-gov" "named" 1.0)] }
+  , { "key": "ledger-b", "caps": [(free.pco.TRANSFER "r:free.pco-gov" "named" 1.0)] } ])
+(free.pco.transfer-create "r:free.pco-gov" "named" (read-keyset 'namedacct) 1.0)
+;; the user reviews and signs "rotate `named` to the INTENDED owner"
+(env-sigs [ { "key": "named-key"
+            , "caps": [(free.pco.ROTATE "named" (create-principal (read-keyset 'intended)))] } ])
+;; a hostile page swaps only the DATA block for the attacker's keyset
+(expect-failure
+  "R6 the signature does not authorise installing a different guard"
+  "Keyset failure (keys-all): [named-ke...]"
+  (free.pco.rotate "named" (read-keyset 'attacker)))
+;; ...and the intended rotation the user actually approved still works
+(free.pco.rotate "named" (read-keyset 'intended))
+(expect "R6 the guard the user approved is the one installed"
+  (create-principal (read-keyset 'intended))
+  (create-principal (at 'guard (free.pco.details "named"))))
+(rollback-tx)
+
+(begin-tx "R6b: a vote-key registration signature cannot install another key")
+(env-data
+  { "intended-vk": { "keys": ["intended-hot"], "pred": "keys-all" }
+  , "attacker-vk": { "keys": ["attacker-hot"], "pred": "keys-all" } })
+(env-sigs [ { "key": "alice-key"
+            , "caps": [(free.pco.VOTE-KEY-ADMIN "alice"
+                         (create-principal (read-keyset 'intended-vk)))] } ])
+(expect-failure
+  "R6b the signature does not authorise registering a different vote key"
+  "Keyset failure (keys-all): [alice-ke...]"
+  (free.pco.set-vote-key "alice" (read-keyset 'attacker-vk)))
+(free.pco.set-vote-key "alice" (read-keyset 'intended-vk))
+(expect "R6b the vote key the user approved is the one registered" true
+  (at 'active (free.pco.get-vote-key "alice")))
+(rollback-tx)
+
+(print "regressions.repl: all post-audit coverage gaps asserted")
+
+(print "regressions.repl: ALL TESTS PASSED")

@@ -1,0 +1,70 @@
+;; frozen-pool.repl-must-fail — THIS FILE MUST FAIL TO LOAD.
+;;
+;; THE PROPERTY: `pco-claim` must not be freezable while the claim pool still
+;; holds tokens.
+;;
+;; WHY, measured. `pco-claim` calls `pco` (get-balance, transfer-create,
+;; precision), and a dependent runs the PINNED copy of its dependency. That
+;; pinned copy dies the moment it touches the database unless the newer `pco`
+;; blesses the old hash - "Execution aborted, hash not blessed for module
+;; <ns>.pco". Compose that with a freeze and ~900,000 PCO is gone: freeze this
+;; module while the pool is funded, then upgrade `pco` without blessing, and
+;; pool-balance, grant, claim AND sweep-pool - the documented recovery - all die.
+;; A frozen module cannot be redeployed to re-pin, so nothing recovers it: not a
+;; key, not a quorum, not an upgrade. The tokens stay visible in pco.accounts and
+;; unspendable forever.
+;;
+;; `pco-gas-station` already carried a hard footer enforce against its own freeze
+;; for this same class of hazard, over a 1 KDA float. This module guards 900,000
+;; PCO and had only a prose warning in the runbook. Now it refuses, which is the
+;; precondition the sanctioned freeze order already stated: close claiming, sweep,
+;; freeze pco, re-pin, then freeze this.
+;;
+;; Delete that footer enforce and this file starts LOADING, which run.sh reports
+;; as a failure.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "deploy the live pair and FUND the pool")
+(env-data
+  { "ns": "free", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "holder": { "keys": ["holder-key"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(load "../contracts/pco-claim.pact")
+(free.pco.init-mint
+  [ { "account": (free.pco-claim.pool-account)
+    , "guard": (free.pco-claim.pool-guard), "amount": 900000.0 }
+  , { "account": "holder", "guard": (read-keyset 'holder), "amount": 100000.0 } ])
+(expect "the pool really is funded" 900000.0 (free.pco-claim.pool-balance))
+(commit-tx)
+
+;; The freeze attempt. NO sweep first - that omission is the whole point.
+(begin-tx "attempt to freeze pco-claim over a FUNDED pool")
+(env-data { "ns": "free", "upgrade": true
+          , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0 })
+(env-keys ["ledger-a", "ledger-b"])
+(namespace "free")
+;; must abort with "pco-claim must not be frozen while the pool holds tokens"
+(load "fixtures/frozen-pco-claim.pact")
+
+;; Unreachable. If control reaches here, 900,000 PCO is one unblessed `pco`
+;; upgrade away from being permanently unrecoverable.
+(print "REACHED: pco-claim froze over a funded pool - the interlock is gone")
+(commit-tx)

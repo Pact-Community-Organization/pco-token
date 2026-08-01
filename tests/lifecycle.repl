@@ -1,0 +1,364 @@
+;; lifecycle.repl — the full mainnet ceremony in runbook order, one suite:
+;;   keysets (gov 2-of-3 + ops 1-key) -> deploys (token, claim, station) ->
+;;   mint -> station fund -> claim open (ops key SOLO) -> claims ->
+;;   proposal -> votes -> cross-chain step 0 -> keyset ROTATION ->
+;;   post-rotation admin + ops -> close + sweep.
+;; Key roles: device-a = the ops seat; b/c = the other two seats.
+;; Doubles as the gas-measurement source for the mainnet cost estimate
+;; (table gas model; devnet receipts are the confirming layer).
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(env-gasmodel "table")
+(env-gaslimit 150000)
+
+;; --- 0. environment (coin for the station account) ---
+(begin-tx "environment")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+;; --- 1. keyset ceremony (2-of-3 over three device keys) ---
+(begin-tx "keyset")
+(env-data
+  { "ns": "free"
+  , "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "gov-threshold": 0.001
+  , "pco-gov": { "keys": ["device-a", "device-b", "device-c"], "pred": "keys-2" }
+  , "pco-ops": { "keys": ["device-a"], "pred": "keys-all" }
+  , "ns-guard": { "keys": ["device-a", "device-b", "device-c"], "pred": "keys-2" } })
+(env-keys ["device-a", "device-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(env-gas 0)
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(let ((g (env-gas)))
+  (print (format "GAS define both keysets: {}" [g]))
+  ;; ceiling: n/a
+  (expect "gas budget: define both keysets" true (<= g 100)))
+(commit-tx)
+
+;; --- 2. deploys, gas-metered (cost model input) ---
+(begin-tx "deploy token")
+(env-gas 0)
+(load "../contracts/pco.pact")
+(let ((g (env-gas)))
+  (print (format "GAS deploy pco (token): {}" [g]))
+  ;; ceiling: build-tx deploy-token 90000 (mainnet-measured 44778)
+  (expect "gas budget: deploy pco (token)" true (<= g 60000)))
+(commit-tx)
+
+(begin-tx "deploy claim")
+(env-gas 0)
+(load "../contracts/pco-claim.pact")
+(let ((g (env-gas)))
+  (print (format "GAS deploy pco-claim: {}" [g]))
+  ;; ceiling: build-tx deploy-claim 60000 (mainnet-measured 24523)
+  (expect "gas budget: deploy pco-claim" true (<= g 33000)))
+(commit-tx)
+
+(begin-tx "governance names the ops authority")
+(env-keys ["device-a", "device-b"])
+(free.pco.set-ops-guard (read-keyset 'pco-ops))
+(commit-tx)
+
+(begin-tx "deploy station")
+(env-gas 0)
+(load "../contracts/pco-gas-station.pact")
+(let ((g (env-gas)))
+  (print (format "GAS deploy pco-gas-station: {}" [g]))
+  ;; ceiling: build-tx deploy-station 40000
+  (expect "gas budget: deploy pco-gas-station" true (<= g 16000)))
+(commit-tx)
+
+;; --- 3. one-shot mint: 90% pool, 10% reserve ---
+(begin-tx "mint")
+(env-keys ["device-a", "device-c"])
+(env-gas 0)
+(free.pco.init-mint
+  [ { "account": (free.pco-claim.pool-account)
+    , "guard": (free.pco-claim.pool-guard)
+    , "amount": 900000.0 }
+  , { "account": "r:free.pco-gov"
+    , "guard": (keyset-ref-guard "free.pco-gov")
+    , "amount": 100000.0 } ])
+(let ((g (env-gas)))
+  (print (format "GAS init-mint: {}" [g]))
+  ;; ceiling: build-tx mint 4000
+  (expect "gas budget: init-mint" true (<= g 400)))
+(commit-tx)
+
+;; --- 4. fund the station (ceremony: coin.transfer-create from the ops acct) ---
+(begin-tx "fund station")
+(env-data { "ops": { "keys": ["ops-key"], "pred": "keys-all" } })
+(test-capability (coin.COINBASE))
+(coin.coinbase "ops-payer" (read-keyset 'ops) 10.0)
+(env-sigs [ { "key": "ops-key"
+            , "caps": [(coin.TRANSFER "ops-payer" (free.pco-gas-station.station-account) 2.0)] } ])
+(coin.transfer-create "ops-payer" (free.pco-gas-station.station-account)
+  (free.pco-gas-station.create-gas-payer-guard) 2.0)
+(expect "station funded" 2.0 (coin.get-balance (free.pco-gas-station.station-account)))
+(commit-tx)
+
+;; --- 5. open the claim with the first engagement code — the ops key SOLO
+;;        (the routine-tier path a mainnet claim round actually uses) ---
+(begin-tx "open claims (ops key solo): genesis round + master switch")
+(env-keys ["device-a"])
+(env-gas 0)
+(free.pco-claim.create-round "genesis" (hash "pco-quest-1") 100.0 30000.0
+  (time "2026-08-01T00:00:00Z") (time "2026-08-31T00:00:00Z"))
+(free.pco-claim.set-open true)
+(let ((g (env-gas)))
+  (print (format "GAS create-round + set-open (ops branch): {}" [g]))
+  ;; ceiling: build-tx open-claims 3000
+  (expect "gas budget: create-round + set-open (ops branch)" true (<= g 300)))
+(commit-tx)
+
+;; --- 6. claims (three k: principals; no claimer signatures) ---
+(env-data
+  { "u1": { "keys": ["1111111111111111111111111111111111111111111111111111111111111111"], "pred": "keys-all" }
+  , "u2": { "keys": ["2222222222222222222222222222222222222222222222222222222222222222"], "pred": "keys-all" }
+  , "u3": { "keys": ["3333333333333333333333333333333333333333333333333333333333333333"], "pred": "keys-all" } })
+
+(begin-tx "claims")
+(env-sigs [])
+(env-gas 0)
+(free.pco-claim.claim "genesis"
+  "k:1111111111111111111111111111111111111111111111111111111111111111"
+  (read-keyset 'u1) "pco-quest-1")
+(let ((g (env-gas)))
+  (print (format "GAS claim (first, creates account): {}" [g]))
+  ;; ceiling: station MAX-GAS-LIMIT 6000
+  (expect "gas budget: claim (first, creates account)" true (<= g 400)))
+(env-gas 0)
+(free.pco-claim.claim "genesis"
+  "k:2222222222222222222222222222222222222222222222222222222222222222"
+  (read-keyset 'u2) "pco-quest-1")
+(let ((g (env-gas)))
+  (print (format "GAS claim (second): {}" [g]))
+  ;; ceiling: station MAX-GAS-LIMIT 6000
+  (expect "gas budget: claim (second)" true (<= g 400)))
+(free.pco-claim.claim "genesis"
+  "k:3333333333333333333333333333333333333333333333333333333333333333"
+  (read-keyset 'u3) "pco-quest-1")
+(expect "pool down 300" 899700.0 (free.pco-claim.pool-balance))
+(commit-tx)
+
+;; --- 7. governance: the org opens a ranked-choice question (ops key);
+;;        claimants rank the options with their live balances ---
+(begin-tx "proposal + ranked ballots")
+(env-keys ["device-a"])
+(env-gas 0)
+(free.pco.create-proposal
+  "Which template family should the catalog grow next?"
+  "Advisory signal for the PCO roadmap - rank the options."
+  ["vesting" "oracle" "marketplace"] 168)
+(let ((g (env-gas)))
+  (print (format "GAS create-proposal: {}" [g]))
+  ;; ceiling: self-paid
+  (expect "gas budget: create-proposal" true (<= g 400)))
+;; K=3: rank position p contributes weight*(3-p) points
+(env-sigs [ { "key": "2222222222222222222222222222222222222222222222222222222222222222"
+            , "caps": [(free.pco.VOTE "1" "k:2222222222222222222222222222222222222222222222222222222222222222")] } ])
+(env-gas 0)
+(free.pco.cast-vote "1"
+  "k:2222222222222222222222222222222222222222222222222222222222222222" [0 1])
+(let ((g (env-gas)))
+  (print (format "GAS cast-vote: {}" [g]))
+  ;; ceiling: self-paid
+  (expect "gas budget: cast-vote" true (<= g 450)))
+(env-sigs [ { "key": "3333333333333333333333333333333333333333333333333333333333333333"
+            , "caps": [(free.pco.VOTE "1" "k:3333333333333333333333333333333333333333333333333333333333333333")] } ])
+(free.pco.cast-vote "1"
+  "k:3333333333333333333333333333333333333333333333333333333333333333" [1])
+(let ((r (free.pco.get-results "1")))
+  ;; u2 (100): [0 1] -> opt0 +300, opt1 +200 · u3 (100): [1] -> opt1 +300
+  (expect "Borda scores tallied" [300.0 500.0 0.0] (at 'scores r))
+  (expect "turnout = both ballots" 200.0 (at 'turnout r)))
+(commit-tx)
+
+;; --- 8. transfer under an open proposal (release path, gas with load) ---
+(begin-tx "transfer with governance load")
+(env-sigs [ { "key": "2222222222222222222222222222222222222222222222222222222222222222"
+            , "caps": [(free.pco.TRANSFER "k:2222222222222222222222222222222222222222222222222222222222222222" "k:3333333333333333333333333333333333333333333333333333333333333333" 40.0)] } ])
+(env-gas 0)
+(free.pco.transfer
+  "k:2222222222222222222222222222222222222222222222222222222222222222"
+  "k:3333333333333333333333333333333333333333333333333333333333333333" 40.0)
+(let ((g (env-gas)))
+  (print (format "GAS transfer (1 open proposal): {}" [g]))
+  ;; ceiling: self-paid
+  (expect "gas budget: transfer (1 open proposal)" true (<= g 700)))
+(let ((r (free.pco.get-results "1")))
+  ;; u2's ballot [0 1] released 40 weight -> opt0 -120, opt1 -80; u3 untouched
+  (expect "sender points released to the remainder" [180.0 420.0 0.0] (at 'scores r))
+  (expect "turnout follows" 160.0 (at 'turnout r)))
+(commit-tx)
+
+;; --- 9. cross-chain step 0 (SPV resume is devnet-only) ---
+(begin-tx "cross-chain send, step 0")
+(env-sigs [ { "key": "3333333333333333333333333333333333333333333333333333333333333333"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "k:3333333333333333333333333333333333333333333333333333333333333333" "k:3333333333333333333333333333333333333333333333333333333333333333" 50.0 "1")] } ])
+(env-gas 0)
+(free.pco.transfer-crosschain
+  "k:3333333333333333333333333333333333333333333333333333333333333333"
+  "k:3333333333333333333333333333333333333333333333333333333333333333"
+  (read-keyset 'u3) "1" 50.0)
+(let ((g (env-gas)))
+  (print (format "GAS transfer-crosschain step 0: {}" [g]))
+  ;; ceiling: self-paid
+  (expect "gas budget: transfer-crosschain step 0" true (<= g 800)))
+(let ((r (free.pco.get-results "1")))
+  ;; u3 now holds 90 (100+40-50); ballot [1] excess 10 -> opt1 -30
+  (expect "outbound points shrunk to the remaining balance" [180.0 390.0 0.0] (at 'scores r)))
+(commit-tx)
+
+;; --- 10. ROTATION: device-c is lost; device-d replaces it ---
+(begin-tx "rotate the community keyset")
+(env-data { "pco-gov-v2": { "keys": ["device-a", "device-b", "device-d"], "pred": "keys-2" } })
+(env-keys ["device-a", "device-b"])
+(namespace "free")
+(env-gas 0)
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov-v2))
+(let ((g (env-gas)))
+  (print (format "GAS keyset rotation: {}" [g]))
+  ;; ceiling: build-tx rotate
+  (expect "gas budget: keyset rotation" true (<= g 100)))
+(commit-tx)
+
+(begin-tx "old pair with the lost key is powerless")
+(env-keys ["device-c", "device-a"])
+(expect-failure "c+a is now 1 valid key" "Keyset failure"
+  (acquire-module-admin free.pco))
+(rollback-tx)
+
+(begin-tx "post-rotation admin op under the new pair (OPS governance fallback)")
+(env-keys ["device-d", "device-b"])
+;; any OPS-tier call proves the fallback; set-round-active is used because the
+;; genesis round already has claims and its code is therefore frozen by design.
+(free.pco-claim.set-round-active "genesis" true)
+(commit-tx)
+
+(begin-tx "ops key is ORTHOGONAL to governance rotation: still operates solo")
+(env-keys ["device-a"])
+(free.pco-claim.set-round-active "genesis" true)
+(commit-tx)
+
+;; --- 10b. UPGRADE path: redeploy pco-claim with upgrade:true (the shape
+;;         any live-chain ships of this module use; footer must touch nothing) ---
+(begin-tx "pco-claim redeploy as an upgrade")
+(env-data
+  { "ns": "free", "upgrade": true
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "gov-threshold": 0.001 })
+(env-keys ["device-a", "device-d"])
+(load "../contracts/pco-claim.pact")
+(expect "state survived the upgrade (config intact, still open)" true
+  (at 'open (free.pco-claim.get-config)))
+(expect "pool balance untouched by the upgrade" 899700.0
+  (free.pco-claim.pool-balance))
+(commit-tx)
+
+;; --- 10c. a judged grant, gas-metered (the ops award path) ---
+(begin-tx "grant (ops key solo)")
+(env-data { "u1": { "keys": ["1111111111111111111111111111111111111111111111111111111111111111"], "pred": "keys-all" } })
+(env-keys ["device-a"])
+(env-gas 0)
+(free.pco-claim.grant
+  "k:1111111111111111111111111111111111111111111111111111111111111111"
+  (read-keyset 'u1) 250.0 "builder recognition batch 1")
+(let ((g (env-gas)))
+  (print (format "GAS grant: {}" [g]))
+  ;; ceiling: build-tx grant 6000
+  (expect "gas budget: grant" true (<= g 450)))
+(expect "grant landed" 350.0
+  (free.pco.get-balance "k:1111111111111111111111111111111111111111111111111111111111111111"))
+(commit-tx)
+
+;; --- 10b. grant-batch at MAX-BATCH — the WORST CASE, which nothing measured ---
+;;
+;; This is the measurement whose absence was the point of the whole gas item. A
+;; mutation audit found lifecycle.repl printing gas for 14 operations and
+;; asserting NONE of them (`grep -c "expect.*env-gas"` = 0), so a gas regression
+;; could not turn the suite red. The consequence was concrete: grant-batch at
+;; MAX-BATCH=20 costs far more than the 6,000 limit build-tx.ts hardcoded for it,
+;; and every gate stayed green. On mainnet that is a monthly batch that aborts
+;; out of gas, mid-ceremony, having burned the fee.
+;;
+;; The builder limit was raised to 20,000 on the strength of this number. A
+;; too-HIGH limit costs nothing (gas is charged on USE, and 150,000 is the
+;; per-transaction ceiling); a too-LOW one fails the transaction. Mainnet runs
+;; roughly 2x the REPL/devnet cost for the same code, so the limit is set from
+;; this figure with that multiple plus margin, never from the raw REPL number.
+(begin-tx "grant-batch at MAX-BATCH=20 (worst case)")
+(env-keys ["device-a"])
+(env-data
+  { "b0": { "keys": ["0000000000000000000000000000000000000000000000000000000000000000"], "pred": "keys-all" }
+  , "b1": { "keys": ["0101010101010101010101010101010101010101010101010101010101010101"], "pred": "keys-all" }
+  , "b2": { "keys": ["0202020202020202020202020202020202020202020202020202020202020202"], "pred": "keys-all" }
+  , "b3": { "keys": ["0303030303030303030303030303030303030303030303030303030303030303"], "pred": "keys-all" }
+  , "b4": { "keys": ["0404040404040404040404040404040404040404040404040404040404040404"], "pred": "keys-all" }
+  , "b5": { "keys": ["0505050505050505050505050505050505050505050505050505050505050505"], "pred": "keys-all" }
+  , "b6": { "keys": ["0606060606060606060606060606060606060606060606060606060606060606"], "pred": "keys-all" }
+  , "b7": { "keys": ["0707070707070707070707070707070707070707070707070707070707070707"], "pred": "keys-all" }
+  , "b8": { "keys": ["0808080808080808080808080808080808080808080808080808080808080808"], "pred": "keys-all" }
+  , "b9": { "keys": ["0909090909090909090909090909090909090909090909090909090909090909"], "pred": "keys-all" }
+  , "b10": { "keys": ["1010101010101010101010101010101010101010101010101010101010101010"], "pred": "keys-all" }
+  , "b11": { "keys": ["1111111111111111111111111111111111111111111111111111111111111111"], "pred": "keys-all" }
+  , "b12": { "keys": ["1212121212121212121212121212121212121212121212121212121212121212"], "pred": "keys-all" }
+  , "b13": { "keys": ["1313131313131313131313131313131313131313131313131313131313131313"], "pred": "keys-all" }
+  , "b14": { "keys": ["1414141414141414141414141414141414141414141414141414141414141414"], "pred": "keys-all" }
+  , "b15": { "keys": ["1515151515151515151515151515151515151515151515151515151515151515"], "pred": "keys-all" }
+  , "b16": { "keys": ["1616161616161616161616161616161616161616161616161616161616161616"], "pred": "keys-all" }
+  , "b17": { "keys": ["1717171717171717171717171717171717171717171717171717171717171717"], "pred": "keys-all" }
+  , "b18": { "keys": ["1818181818181818181818181818181818181818181818181818181818181818"], "pred": "keys-all" }
+  , "b19": { "keys": ["1919191919191919191919191919191919191919191919191919191919191919"], "pred": "keys-all" } })
+(env-gas 0)
+(free.pco-claim.grant-batch
+  [ { "account": "k:0000000000000000000000000000000000000000000000000000000000000000", "guard": (read-keyset 'b0), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:0101010101010101010101010101010101010101010101010101010101010101", "guard": (read-keyset 'b1), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:0202020202020202020202020202020202020202020202020202020202020202", "guard": (read-keyset 'b2), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:0303030303030303030303030303030303030303030303030303030303030303", "guard": (read-keyset 'b3), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:0404040404040404040404040404040404040404040404040404040404040404", "guard": (read-keyset 'b4), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:0505050505050505050505050505050505050505050505050505050505050505", "guard": (read-keyset 'b5), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:0606060606060606060606060606060606060606060606060606060606060606", "guard": (read-keyset 'b6), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:0707070707070707070707070707070707070707070707070707070707070707", "guard": (read-keyset 'b7), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:0808080808080808080808080808080808080808080808080808080808080808", "guard": (read-keyset 'b8), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:0909090909090909090909090909090909090909090909090909090909090909", "guard": (read-keyset 'b9), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:1010101010101010101010101010101010101010101010101010101010101010", "guard": (read-keyset 'b10), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:1111111111111111111111111111111111111111111111111111111111111111", "guard": (read-keyset 'b11), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:1212121212121212121212121212121212121212121212121212121212121212", "guard": (read-keyset 'b12), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:1313131313131313131313131313131313131313131313131313131313131313", "guard": (read-keyset 'b13), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:1414141414141414141414141414141414141414141414141414141414141414", "guard": (read-keyset 'b14), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:1515151515151515151515151515151515151515151515151515151515151515", "guard": (read-keyset 'b15), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:1616161616161616161616161616161616161616161616161616161616161616", "guard": (read-keyset 'b16), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:1717171717171717171717171717171717171717171717171717171717171717", "guard": (read-keyset 'b17), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:1818181818181818181818181818181818181818181818181818181818181818", "guard": (read-keyset 'b18), "amount": 1.0, "reason": "worst-case batch sizing" }
+    { "account": "k:1919191919191919191919191919191919191919191919191919191919191919", "guard": (read-keyset 'b19), "amount": 1.0, "reason": "worst-case batch sizing" } ])
+(let ((g (env-gas)))
+  (print (format "GAS grant-batch (MAX-BATCH=20): {}" [g]))
+  ;; ceiling: build-tx grant-batch 20000 (was 6000, which this exceeded)
+  (expect "gas budget: grant-batch at MAX-BATCH" true (<= g 9000)))
+(expect "all 20 receivers were paid" 1.0 (free.pco.get-balance "k:1919191919191919191919191919191919191919191919191919191919191919"))
+(expect "and the first one too" 1.0 (free.pco.get-balance "k:0000000000000000000000000000000000000000000000000000000000000000"))
+(rollback-tx)
+
+;; --- 11. close + sweep to the reserve ---
+(begin-tx "close and sweep")
+(env-keys ["device-a", "device-d"])
+(free.pco-claim.set-open false)
+(free.pco-claim.sweep-pool "r:free.pco-gov" (keyset-ref-guard "free.pco-gov"))
+(expect "pool empty" 0.0 (free.pco-claim.pool-balance))
+;; conservation across the whole lifecycle: reserve got back everything
+;; except the 300 claimed + 250 granted (50 of which crossed chains - all
+;; still accounted in balances; proposals are admin-authored, no funding out):
+(expect "reserve = 100000 + 899450" 999450.0
+  (free.pco.get-balance "r:free.pco-gov"))
+(commit-tx)
+
+(print "lifecycle.repl: ALL TESTS PASSED")

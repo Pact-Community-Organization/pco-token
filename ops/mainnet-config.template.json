@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy to ops/mainnet-config.json during the ceremony (gitignored path is fine to keep local). Pubkeys only — NEVER seed material.",
+  "ns": "TO-FILL: n_<derived by the preflight>",
+  "deviceA": "TO-FILL: 64-hex pubkey, seat A (also THE pco-ops key), m/44'/626'/0'/0/0",
+  "deviceB": "TO-FILL: 64-hex pubkey, seat B, m/44'/626'/0'/0/0",
+  "deviceC": "TO-FILL: 64-hex pubkey, seat C, break-glass spare, m/44'/626'/0'/0/1 (index 1 — personal index-0 stays out)",
+  "gasPayer": {
+    "account": "TO-FILL: k:<softkey pub>",
+    "publicKey": "TO-FILL: <softkey pub>"
+  },
+  "totalSupply": 1000000.0
+}

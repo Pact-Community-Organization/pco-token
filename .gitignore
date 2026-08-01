@@ -1,0 +1,5 @@
+node_modules/
+ops/out/
+ops/mainnet-config.json
+*.log
+tests/.pc-history

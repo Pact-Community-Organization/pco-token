@@ -1,0 +1,1063 @@
+;; negatives.repl — exhaustive "the wrong thing fails" suite.
+;;
+;; The per-module suites (pco.repl / pco-claim.repl / pco-gas-station.repl)
+;; cover the headline negatives inline. THIS file is the completeness sweep:
+;; one deployed + minted world, then every remaining enforce / guard / bound
+;; branch in all three modules exercised as a FAILURE with its exact error
+;; substring — so that "doing the wrong thing fails as expected" is proven
+;; branch by branch before mainnet.
+;;
+;; REPL discipline: expect-failure does NOT roll back partial writes and
+;; commit-tx would persist the leak, so every write-capable negative lives in
+;; its own tx ended by (rollback-tx). Error substrings match the REPL Pretty
+;; column (on-chain BoundedText differs — see pact-traps).
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+;; ---------------------------------------------------------------------------
+;; Shared world: interfaces + coin + namespace + keyset + all 3 modules + mint
+;; ---------------------------------------------------------------------------
+(begin-tx "interfaces + coin")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "deploy all three modules")
+(env-data
+  { "ns": "free"
+  , "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "gov-threshold": 0.001
+  , "pco-gov":  { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "pco-ops":  { "keys": ["ledger-a"], "pred": "keys-all" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(load "../contracts/pco-claim.pact")
+(load "../contracts/pco-gas-station.pact")
+(commit-tx)
+
+(begin-tx "governance names the ops authority")
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco.set-ops-guard (read-keyset 'pco-ops))
+(commit-tx)
+
+(begin-tx "mint: whale + holder + claim pool + reserve")
+(env-data
+  { "whale":  { "keys": ["whale-key"],  "pred": "keys-all" }
+  , "holder": { "keys": ["holder-key"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-c"])
+(free.pco.init-mint
+  [ { "account": "whale",  "guard": (read-keyset 'whale),  "amount": 600000.0 }
+  , { "account": "holder", "guard": (read-keyset 'holder), "amount": 200000.0 }
+  , { "account": (free.pco-claim.pool-account), "guard": (free.pco-claim.pool-guard), "amount": 100000.0 }
+  , { "account": "r:free.pco-gov", "guard": (keyset-ref-guard "free.pco-gov"), "amount": 100000.0 } ])
+(commit-tx)
+
+;; ===========================================================================
+;; MODULE `pco` — TOKEN CORE
+;; ===========================================================================
+
+;; --- managed TRANSFER cap invariants (run in the cap body before any move) ---
+(begin-tx "transfer: sender == receiver rejected")
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER "whale" "whale" 1.0)] } ])
+(expect-failure "same sender and receiver" "same sender and receiver"
+  (free.pco.transfer "whale" "whale" 1.0))
+(rollback-tx)
+
+(begin-tx "transfer: non-positive amount rejected")
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER "whale" "holder" 0.0)] } ])
+(expect-failure "amount must be positive" "amount must be positive"
+  (free.pco.transfer "whale" "holder" 0.0))
+(rollback-tx)
+
+(begin-tx "transfer: over-precise amount rejected (enforce-unit)")
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER "whale" "holder" 1.0)] } ])
+(expect-failure "precision violation" "precision violation"
+  (free.pco.transfer "whale" "holder" 1.0000000000001))
+(rollback-tx)
+
+(begin-tx "transfer: insufficient funds rejected")
+(env-data { "sink": { "keys": ["sink-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "holder-key", "caps": [(free.pco.TRANSFER "holder" "sink" 999999.0)] } ])
+(expect-failure "insufficient funds" "insufficient funds"
+  (free.pco.transfer-create "holder" "sink" (read-keyset 'sink) 999999.0))
+(rollback-tx)
+
+(begin-tx "transfer: no signature at all (managed cap never installed)")
+(env-sigs [])
+(expect-failure "unsigned transfer rejected before any move" "Managed capability not installed"
+  (free.pco.transfer "whale" "holder" 1.0))
+(rollback-tx)
+
+;; --- credit-side guard binding (transfer-create to an existing account with a
+;;     DIFFERENT guard must not silently rebind it) ---
+(begin-tx "transfer-create: guard mismatch on an existing account")
+(env-data { "wrong": { "keys": ["someone-else"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER "whale" "holder" 1.0)] } ])
+(expect-failure "credit to existing acct with wrong guard rejected" "account guard mismatch"
+  (free.pco.transfer-create "whale" "holder" (read-keyset 'wrong) 1.0))
+(rollback-tx)
+
+;; --- account-name protocol (validate-account + enforce-reserved) ---
+(begin-tx "create-account: name too short")
+(env-data { "g": { "keys": ["gk"], "pred": "keys-all" } })
+(expect-failure "min length enforced" "min length"
+  (free.pco.create-account "ab" (read-keyset 'g)))
+(rollback-tx)
+
+(begin-tx "create-account: non-latin1 charset rejected")
+(env-data { "g": { "keys": ["gk"], "pred": "keys-all" } })
+;; a snowman (U+2603, base64 "4piD") is outside latin-1 (CHARSET_LATIN1) so
+;; it trips is-charset. Built via base64-decode to avoid source-literal escapes.
+(expect-failure "charset enforced" "does not conform to the token contract charset"
+  (free.pco.create-account (+ "snow-" (base64-decode "4piD")) (read-keyset 'g)))
+(rollback-tx)
+
+(begin-tx "create-account: k: squatting (single-key protocol) rejected")
+(env-data { "foreign": { "keys": ["not-the-principal"], "pred": "keys-all" } })
+(expect-failure "k: must be the principal of its guard" "Single-key account protocol violation"
+  (free.pco.create-account
+    "k:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    (read-keyset 'foreign)))
+(rollback-tx)
+
+(begin-tx "create-account: w: reserved protocol rejected under a foreign guard")
+(env-data { "foreign": { "keys": ["k1", "k2"], "pred": "keys-all" } })
+(expect-failure "w: reserved protocol violation" "Reserved protocol guard violation"
+  (free.pco.create-account
+    "w:mismatchmismatchmismatchmismatchmismatchmis:keys-all"
+    (read-keyset 'foreign)))
+(rollback-tx)
+
+;; --- rotate: principal accounts may not escape their proper guard ---
+(begin-tx "rotate: principal account cannot rotate to a foreign guard")
+(env-data
+  { "kacct": { "keys": ["cafe0000000000000000000000000000000000000000000000000000cafe0000"], "pred": "keys-all" }
+  , "other": { "keys": ["deadbeef0000000000000000000000000000000000000000000000000000dead"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER "whale" "k:cafe0000000000000000000000000000000000000000000000000000cafe0000" 1.0)] } ])
+(free.pco.transfer-create "whale"
+  "k:cafe0000000000000000000000000000000000000000000000000000cafe0000" (read-keyset 'kacct) 1.0)
+(env-sigs [ { "key": "cafe0000000000000000000000000000000000000000000000000000cafe0000"
+            , "caps": [(free.pco.ROTATE "k:cafe0000000000000000000000000000000000000000000000000000cafe0000" (create-principal (read-keyset 'other)))] } ])
+(expect-failure "principal cannot rotate away from its guard" "unsafe for principal accounts"
+  (free.pco.rotate "k:cafe0000000000000000000000000000000000000000000000000000cafe0000" (read-keyset 'other)))
+(rollback-tx)
+
+(begin-tx "rotate: foreign key cannot rotate someone else's account")
+(env-data { "new": { "keys": ["new-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "someone-else", "caps": [(free.pco.ROTATE "whale" (create-principal (read-keyset 'new)))] } ])
+(expect-failure "rotate needs the account's own guard" "Keyset failure"
+  (free.pco.rotate "whale" (read-keyset 'new)))
+(rollback-tx)
+
+;; --- ops authority (governance-owned; ops can never re-point itself) ---
+(begin-tx "ops authority: the ops key cannot name its successor")
+(env-data { "hijack": { "keys": ["ledger-a"], "pred": "keys-all" } })
+(env-keys ["ledger-a"])                      ; the CURRENT ops authority, alone
+(expect-failure "ops cannot set the ops guard" "Keyset failure"
+  (free.pco.set-ops-guard (read-keyset 'hijack)))
+(rollback-tx)
+
+(begin-tx "ops authority: a holder cannot set it either")
+(env-data { "hijack": { "keys": ["whale-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key", "caps": [] } ])
+(expect-failure "a holder cannot set the ops guard" "Keyset failure"
+  (free.pco.set-ops-guard (read-keyset 'hijack)))
+(rollback-tx)
+
+(begin-tx "ops authority: a single governance key is not enough (2-of-3)")
+(env-data { "newops": { "keys": ["ledger-x"], "pred": "keys-all" } })
+(env-keys ["ledger-b"])
+(expect-failure "one gov key cannot set the ops guard" "Keyset failure"
+  (free.pco.set-ops-guard (read-keyset 'newops)))
+(rollback-tx)
+
+;; --- vote key (the hot key can ONLY vote; registration is main-guard-only) ---
+(begin-tx "vote key: the hot key cannot register or re-point itself")
+(env-data { "vk": { "keys": ["hot-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "hot-key", "caps": [(free.pco.VOTE-KEY-ADMIN "whale" (create-principal (read-keyset 'vk)))] } ])
+(expect-failure "registration needs the MAIN guard" "Keyset failure"
+  (free.pco.set-vote-key "whale" (read-keyset 'vk)))
+(rollback-tx)
+
+(begin-tx "vote key: registering for a nonexistent account fails")
+(env-data { "vk": { "keys": ["hot-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "hot-key", "caps": [(free.pco.VOTE-KEY-ADMIN "ghost" (create-principal (read-keyset 'vk)))] } ])
+(expect-failure "no such account row" "No value found"
+  (free.pco.set-vote-key "ghost" (read-keyset 'vk)))
+(rollback-tx)
+
+(begin-tx "vote key: clearing without a registration fails")
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE-KEY-ADMIN "whale" "")] } ])
+(expect-failure "no prior registration to clear" "No row found during update"
+  (free.pco.clear-vote-key "whale"))
+(rollback-tx)
+
+(begin-tx "vote key: a cleared (inactive) hot key cannot vote")
+(env-keys ["ledger-a"])
+(free.pco.create-proposal "the vote" "b" ["a" "b"] 72)
+(env-data { "vk": { "keys": ["hot-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE-KEY-ADMIN "whale" (create-principal (read-keyset 'vk))), (free.pco.VOTE-KEY-ADMIN "whale" "")] } ])
+(free.pco.set-vote-key "whale" (read-keyset 'vk))
+(free.pco.clear-vote-key "whale")
+(env-sigs [ { "key": "hot-key", "caps": [(free.pco.VOTE "1" "whale")] } ])
+(expect-failure "cleared key refused"
+  "neither account guard nor registered vote key satisfied"
+  (free.pco.cast-vote "1" "whale" [0]))
+(rollback-tx)
+
+(begin-tx "vote key: an active hot key has NO power beyond voting")
+(env-data { "vk":  { "keys": ["hot-key"], "pred": "keys-all" }
+          , "new": { "keys": ["hot-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE-KEY-ADMIN "whale" (create-principal (read-keyset 'vk)))] } ])
+(free.pco.set-vote-key "whale" (read-keyset 'vk))
+(env-sigs [ { "key": "hot-key", "caps": [(free.pco.TRANSFER "whale" "holder" 1.0)] } ])
+(expect-failure "hot key cannot transfer" "Keyset failure"
+  (free.pco.transfer "whale" "holder" 1.0))
+(env-sigs [ { "key": "hot-key", "caps": [(free.pco.ROTATE "whale" (create-principal (read-keyset 'new)))] } ])
+(expect-failure "hot key cannot rotate" "Keyset failure"
+  (free.pco.rotate "whale" (read-keyset 'new)))
+(env-sigs [ { "key": "hot-key", "caps": [] } ])
+(expect-failure "hot key cannot open a proposal (admin-authored)"
+  "governance or ops authority required"
+  (free.pco.create-proposal "t" "b" ["a" "b"] 72))
+(env-sigs [ { "key": "hot-key", "caps": [(free.pco.VOTE-KEY-ADMIN "whale" "")] } ])
+(expect-failure "hot key cannot clear the registration" "Keyset failure"
+  (free.pco.clear-vote-key "whale"))
+(rollback-tx)
+
+;; --- cross-chain (cap-body invariants; SPV resume is devnet-only) ---
+(env-data { "whale": { "keys": ["whale-key"], "pred": "keys-all" } })
+(begin-tx "xchain: non-positive amount rejected")
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER_XCHAIN "whale" "whale" 0.0 "1")] } ])
+(expect-failure "xchain amount must be positive" "cross-chain amount must be positive"
+  (free.pco.transfer-crosschain "whale" "whale" (read-keyset 'whale) "1" 0.0))
+(rollback-tx)
+
+(begin-tx "xchain: over-precise amount rejected")
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER_XCHAIN "whale" "whale" 1.0 "1")] } ])
+(expect-failure "xchain precision enforced" "precision violation"
+  (free.pco.transfer-crosschain "whale" "whale" (read-keyset 'whale) "1" 1.0000000000001))
+(rollback-tx)
+
+(begin-tx "xchain: nonexistent target chain rejected (audit M-1)")
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER_XCHAIN "whale" "whale" 1.0 "20")] } ])
+(expect-failure "chain 20 does not exist" "not a valid chain id"
+  (free.pco.transfer-crosschain "whale" "whale" (read-keyset 'whale) "20" 1.0))
+(rollback-tx)
+
+(begin-tx "xchain: same-chain target rejected")
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER_XCHAIN "whale" "whale" 1.0 "0")] } ])
+(expect-failure "cannot xchain to the current chain" "same chain"
+  (free.pco.transfer-crosschain "whale" "whale" (read-keyset 'whale) "0" 1.0))
+(rollback-tx)
+
+;; ===========================================================================
+;; MODULE `pco` — GOVERNANCE
+;; ===========================================================================
+
+(begin-tx "propose: only the org can propose (community goes via the public channels)")
+(env-sigs [ { "key": "whale-key", "caps": [] } ])
+(expect-failure "a token holder cannot create on-chain proposals"
+  "governance or ops authority required"
+  (free.pco.create-proposal "t" "b" ["a" "b"] 72))
+(env-keys ["ledger-b"])
+(expect-failure "a single NON-ops governance key fails both branches"
+  "governance or ops authority required"
+  (free.pco.create-proposal "t" "b" ["a" "b"] 72))
+(rollback-tx)
+
+(begin-tx "propose: duration below the minimum rejected")
+(env-keys ["ledger-a"])
+(expect-failure "duration < 24h" "duration outside"
+  (free.pco.create-proposal "t" "b" ["a" "b"] 23))
+(rollback-tx)
+
+(begin-tx "propose: duration above the maximum rejected")
+(env-keys ["ledger-a"])
+(expect-failure "duration > 720h" "duration outside"
+  (free.pco.create-proposal "t" "b" ["a" "b"] 721))
+(rollback-tx)
+
+(begin-tx "propose: empty title rejected")
+(env-keys ["ledger-a"])
+(expect-failure "empty title" "title 1..120"
+  (free.pco.create-proposal "" "b" ["a" "b"] 72))
+(rollback-tx)
+
+(begin-tx "propose: over-long title rejected")
+(env-keys ["ledger-a"])
+(expect-failure "title > 120 chars"  "title 1..120"
+  (free.pco.create-proposal
+    "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890X"
+    "b" ["a" "b"] 72))
+(rollback-tx)
+
+(begin-tx "propose: option-list bounds enforced")
+(env-keys ["ledger-a"])
+(expect-failure "one option is not a question" "2..5 options required"
+  (free.pco.create-proposal "t" "b" ["only"] 72))
+(expect-failure "more than MAX-OPTIONS refused" "2..5 options required"
+  (free.pco.create-proposal "t" "b" ["a" "b" "c" "d" "e" "f"] 72))
+(expect-failure "duplicate options refused" "options must be distinct"
+  (free.pco.create-proposal "t" "b" ["a" "a"] 72))
+(expect-failure "empty option label refused" "each option 1..60 chars"
+  (free.pco.create-proposal "t" "b" ["a" ""] 72))
+(expect-failure "over-long option label refused" "each option 1..60 chars"
+  (free.pco.create-proposal "t" "b"
+    ["a" "0123456789012345678901234567890123456789012345678901234567890"] 72))
+(rollback-tx)
+
+(begin-tx "propose: off-hub rejected")
+(env-chain-data { "chain-id": "4" })
+(env-keys ["ledger-a"])
+(expect-failure "governance is hub-only" "hub chain only"
+  (free.pco.create-proposal "t" "b" ["a" "b"] 72))
+(rollback-tx)
+(env-chain-data { "chain-id": "0" })
+
+;; MAX-ACTIVE-PROPOSALS: open 3, the 4th must fail
+(begin-tx "propose: 3 open then the 4th refused")
+(env-keys ["ledger-a"])
+(free.pco.create-proposal "p1" "b" ["a" "b"] 72)
+(free.pco.create-proposal "p2" "b" ["a" "b"] 72)
+(free.pco.create-proposal "p3" "b" ["a" "b"] 72)
+(expect-failure "4th proposal refused" "too many active proposals"
+  (free.pco.create-proposal "p4" "b" ["a" "b"] 72))
+(rollback-tx)
+
+;; --- admin-cancel: the accountable early close ---
+(begin-tx "cancel: reason mandatory, authorization enforced, close is final")
+(env-keys ["ledger-a"])
+(free.pco.create-proposal "to-cancel" "b" ["a" "b"] 72)
+(env-sigs [ { "key": "whale-key", "caps": [] } ])
+(expect-failure "a holder cannot cancel" "governance or ops authority required"
+  (free.pco.admin-cancel-proposal "1" "r"))
+(env-keys ["ledger-a"])
+(expect-failure "a public reason is mandatory" "public reason is required"
+  (free.pco.admin-cancel-proposal "1" ""))
+(expect-failure "reason length bounded (audit F2)" "public reason is required"
+  (free.pco.admin-cancel-proposal "1"
+    (fold (+) "" (make-list 300 "0123456789"))))
+(expect "ops cancels with a public reason" "cancelled"
+  (free.pco.admin-cancel-proposal "1" "duplicate of question 7 on the channels"))
+(expect "slot freed immediately" [] (free.pco.open-ids))
+(expect-failure "cannot cancel an already-closed proposal" "proposal already closed"
+  (free.pco.admin-cancel-proposal "1" "again"))
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE "1" "whale")] } ])
+(expect-failure "no votes after a cancel" "voting closed"
+  (free.pco.cast-vote "1" "whale" [0]))
+(rollback-tx)
+
+;; vote negatives (open a proposal in-tx, then attack it)
+(begin-tx "vote negatives")
+(env-keys ["ledger-a"])
+(expect "proposal opens" "1" (free.pco.create-proposal "the vote" "b" ["a" "b" "c"] 72))
+
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE "1" "whale")] } ])
+(expect-failure "empty ranking rejected" "ranking: 1..K entries"
+  (free.pco.cast-vote "1" "whale" []))
+(expect-failure "over-long ranking rejected" "ranking: 1..K entries"
+  (free.pco.cast-vote "1" "whale" [0 1 2 0]))
+(expect-failure "duplicate ranking entries rejected" "ranking entries must be distinct"
+  (free.pco.cast-vote "1" "whale" [0 0]))
+(expect-failure "out-of-range option index rejected" "ranking entry out of range"
+  (free.pco.cast-vote "1" "whale" [3]))
+(expect-failure "negative option index rejected" "ranking entry out of range"
+  (free.pco.cast-vote "1" "whale" [-1]))
+
+(env-sigs [ { "key": "someone-else", "caps": [(free.pco.VOTE "1" "whale")] } ])
+(expect-failure "foreign key cannot vote as whale"
+  "neither account guard nor registered vote key satisfied"
+  (free.pco.cast-vote "1" "whale" [0]))
+
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "reserve barred from voting" "reserve cannot vote"
+  (free.pco.cast-vote "1" "r:free.pco-gov" [0]))
+
+;; zero-weight voter (a real account with no balance)
+(env-data { "empty": { "keys": ["empty-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER "whale" "empty" 1.0)] } ])
+(free.pco.transfer-create "whale" "empty" (read-keyset 'empty) 1.0)
+(env-sigs [ { "key": "empty-key", "caps": [(free.pco.TRANSFER "empty" "whale" 1.0)] } ])
+(free.pco.transfer "empty" "whale" 1.0)   ; drain to 0
+(env-sigs [ { "key": "empty-key", "caps": [(free.pco.VOTE "1" "empty")] } ])
+(expect-failure "zero balance has no voting weight" "no voting weight"
+  (free.pco.cast-vote "1" "empty" [0]))
+
+;; vote off-hub
+(env-chain-data { "chain-id": "2" })
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE "1" "whale")] } ])
+(expect-failure "voting is hub-only" "hub chain only"
+  (free.pco.cast-vote "1" "whale" [0]))
+(env-chain-data { "chain-id": "0" })
+
+;; vote after close
+(env-chain-data { "block-time": (time "2026-08-05T00:00:01Z") })   ; > 72h
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE "1" "whale")] } ])
+(expect-failure "no votes after close" "voting closed"
+  (free.pco.cast-vote "1" "whale" [0]))
+(rollback-tx)
+(env-chain-data { "block-time": (time "2026-08-01T00:00:00Z") })
+
+;; ===========================================================================
+;; MODULE `pco-claim` (v2: rounds + grants)
+;; ===========================================================================
+
+;; TIER SPLIT: ledger-a is the OPS key (free.pco-ops, keys-all over 1) and
+;; MAY solo-run round ops / grants / set-open. The negatives below therefore
+;; probe a single NON-ops governance key, a foreign key, and the boundary:
+;; the ops key must hold NOTHING above the routine tier.
+
+;; --- create-round: authorization ---
+(begin-tx "create-round: single NON-ops governance key insufficient")
+(env-keys ["ledger-b"])
+(expect-failure "1 non-ops key fails both OPS branches" "ops authorization failed"
+  (free.pco-claim.create-round "r-auth" (hash "q") 100.0 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(rollback-tx)
+
+(begin-tx "create-round: foreign key insufficient")
+(env-keys ["attacker-key"])
+(expect-failure "foreign key fails both OPS branches" "ops authorization failed"
+  (free.pco-claim.create-round "r-auth" (hash "q") 100.0 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(rollback-tx)
+
+;; --- create-round: every bound, one by one ---
+(begin-tx "create-round: bound sweep")
+(env-keys ["ledger-a"])
+(expect-failure "empty code hash" "empty code hash"
+  (free.pco-claim.create-round "r-bnd" "" 100.0 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "zero amount" "amount must be positive"
+  (free.pco-claim.create-round "r-bnd" (hash "q") 0.0 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "negative amount" "amount must be positive"
+  (free.pco-claim.create-round "r-bnd" (hash "q") -1.0 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "over-precise amount" "respect the token's precision"
+  (free.pco-claim.create-round "r-bnd" (hash "q") 1.0000000000001 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "amount above MAX-ROUND-AMOUNT" "exceeds the per-claim bound"
+  (free.pco-claim.create-round "r-bnd" (hash "q") 500.000000000001 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "budget below one claim" "budget must cover at least one claim"
+  (free.pco-claim.create-round "r-bnd" (hash "q") 100.0 99.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "over-precise budget" "respect the token's precision"
+  (free.pco-claim.create-round "r-bnd" (hash "q") 100.0 1000.0000000000001
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "budget above MAX-ROUND-BUDGET" "exceeds the per-round bound"
+  (free.pco-claim.create-round "r-bnd" (hash "q") 100.0 30000.000000000001
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "closes == opens" "closes must be after opens"
+  (free.pco-claim.create-round "r-bnd" (hash "q") 100.0 1000.0
+    (time "2026-08-08T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "closes before opens" "closes must be after opens"
+  (free.pco-claim.create-round "r-bnd" (hash "q") 100.0 1000.0
+    (time "2026-08-08T00:00:00Z") (time "2026-08-01T00:00:00Z")))
+(expect-failure "round id too short" "round id must be 3-64 characters"
+  (free.pco-claim.create-round "r" (hash "q") 100.0 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "round id too long" "round id must be 3-64 characters"
+  (free.pco-claim.create-round
+    "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+    (hash "q") 100.0 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "round id with the key separator" "must not contain"
+  (free.pco-claim.create-round "bad|id" (hash "q") 100.0 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(expect-failure "non-ASCII round id" "round id must be ASCII"
+  (free.pco-claim.create-round "ronda-ñ" (hash "q") 100.0 1000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(rollback-tx)
+
+;; --- create-round: the daily ops meter fails closed ---
+(begin-tx "create-round: ops daily cap reached")
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "cap-1" (hash "q1") 500.0 30000.0
+  (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z"))
+(free.pco-claim.create-round "cap-2" (hash "q2") 500.0 10000.0
+  (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z"))
+(expect-failure "40k committed - the next budget breaks the cap" "ops daily cap reached"
+  (free.pco-claim.create-round "cap-3" (hash "q3") 100.0 100.0
+    (time "2026-08-01T00:00:00Z") (time "2026-08-08T00:00:00Z")))
+(rollback-tx)
+
+
+;; ---------------------------------------------------------------------------
+;; GAP CLOSURE (mutation audit 2026-07-29) — each case below kills a mutant that
+;; previously survived the whole suite. They are authorization and protocol
+;; checks whose deletion changed no observable behaviour in any existing test.
+;; ---------------------------------------------------------------------------
+
+;; M-VOTE: cast-vote-internal is PUBLIC and its ONLY authorization is the
+;; require-capability. Deleting that line let anyone vote as anyone; nothing
+;; failed. A caller holding no VOTE capability must be refused.
+(begin-tx "cast-vote-internal refuses a caller that does not hold VOTE")
+(env-keys [])
+(env-sigs [])
+(env-keys ["ledger-a"])
+(free.pco.create-proposal "gapcheck" "does the gate hold?" ["a" "b"] 72)
+(env-keys [])
+(env-sigs [])
+(expect-failure "the internal ballot writer is not callable without VOTE"
+  "not granted"
+  (free.pco.cast-vote-internal "1" "whale" [0]))
+(rollback-tx)
+
+;; M-INSERT: create-account uses `insert`, which aborts on an existing row. If
+;; it were `write`, anyone could overwrite an existing account's GUARD - taking
+;; it over - and its balance. `insert` is the whole protection.
+(begin-tx "create-account cannot overwrite an existing account")
+(env-data { "thief": { "keys": ["thief-key"], "pred": "keys-all" } })
+(expect-failure "re-creating an existing account is refused"
+  "Value already found while in Insert mode"
+  (free.pco.create-account "whale" (read-keyset 'thief)))
+(rollback-tx)
+
+;; M-RESERVED: enforce-reserved inside transfer-create. Without it a k: account
+;; could be created under a guard that is not its principal - the squatting the
+;; create-account path already refuses, reachable by the other door.
+(begin-tx "k: squatting via transfer-create is refused")
+(env-data { "foreign": { "keys": ["not-the-principal"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER "whale"
+                        "k:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" 1.0)] } ])
+(expect-failure "transfer-create honours the reserved-name protocol too"
+  "Single-key account protocol violation"
+  (free.pco.transfer-create "whale"
+    "k:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    (read-keyset 'foreign) 1.0))
+(rollback-tx)
+
+;; --- round management on missing rounds ---
+(begin-tx "set-round-active/code: missing round fails cleanly")
+(env-keys ["ledger-a"])
+;; set-round-active writes straight through, so the missing row surfaces from
+;; `update`; set-round-code reads the row first (to check the no-claims rule),
+;; so it surfaces from `with-read` one step earlier. Both fail closed.
+(expect-failure "no such round to pause" "No row found during update in table"
+  (free.pco-claim.set-round-active "ghost" false))
+(expect-failure "no such round to re-code" "No value found in table"
+  (free.pco-claim.set-round-code "ghost" (hash "q")))
+(expect-failure "empty replacement hash" "empty code hash"
+  (free.pco-claim.set-round-code "ghost" ""))
+(rollback-tx)
+
+(begin-tx "set-open: single NON-ops governance key insufficient")
+(env-keys ["ledger-c"])
+(expect-failure "1 non-ops key cannot open" "ops authorization failed"
+  (free.pco-claim.set-open true))
+(rollback-tx)
+
+;; --- tier boundaries (unchanged by v2) ---
+(begin-tx "tier boundary: ops key alone cannot sweep the pool")
+(env-keys ["ledger-a"])
+(expect-failure "sweep stays 2-of-3" "Keyset failure"
+  (free.pco-claim.sweep-pool "r:free.pco-gov" (keyset-ref-guard "free.pco-gov")))
+(rollback-tx)
+
+(begin-tx "tier boundary: ops key alone holds no module admin on any module")
+(env-keys ["ledger-a"])
+(expect-failure "pco upgrade gate holds" "Keyset failure"
+  (acquire-module-admin free.pco))
+(expect-failure "pco-claim upgrade gate holds" "Keyset failure"
+  (acquire-module-admin free.pco-claim))
+(expect-failure "pco-gas-station upgrade gate holds" "Keyset failure"
+  (acquire-module-admin free.pco-gas-station))
+(rollback-tx)
+
+(begin-tx "tier boundary: ops key alone cannot rotate the GOVERNANCE keyset")
+(env-data { "evil-gov": { "keys": ["ledger-a"], "pred": "keys-all" } })
+(env-keys ["ledger-a"])
+(namespace "free")
+(expect-failure "pco-gov redefinition needs the current 2-of-3" "Keyset failure"
+  (define-keyset "free.pco-gov" (read-keyset 'evil-gov)))
+(rollback-tx)
+
+(begin-tx "tier boundary: ops key alone cannot mint")
+(env-keys ["ledger-a"])
+(env-data { "x": { "keys": ["xk"], "pred": "keys-all" } })
+(expect-failure "MINT stays 2-of-3 (guard fires before the one-shot check)" "Keyset failure"
+  (free.pco.init-mint [ { "account": "x-acct", "guard": (read-keyset 'x), "amount": 1000000.0 } ]))
+(rollback-tx)
+
+;; --- claim gates ---
+(begin-tx "claim: master switch closed rejected")
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "quest-a" (hash "quest-1") 100.0 2500.0
+  (time "2026-08-01T00:00:00Z") (time "2026-08-15T00:00:00Z"))
+(env-keys [])
+(env-data { "cl": { "keys": ["c0ffee000000000000000000000000000000000000000000000000000c0ffee0"], "pred": "keys-all" } })
+(expect-failure "claim while closed" "not open"
+  (free.pco-claim.claim "quest-a"
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) "quest-1"))
+(rollback-tx)
+
+;; now arm a real round + master open for the remaining claim negatives
+(begin-tx "arm the claim (round + master switch)")
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco-claim.create-round "quest-a" (hash "quest-1") 100.0 2500.0
+  (time "2026-08-01T00:00:00Z") (time "2026-08-15T00:00:00Z"))
+(free.pco-claim.create-round "quest-later" (hash "quest-2") 100.0 2500.0
+  (time "2026-09-01T00:00:00Z") (time "2026-09-15T00:00:00Z"))
+(free.pco-claim.set-open true)
+(commit-tx)
+
+(env-data
+  { "cl": { "keys": ["c0ffee000000000000000000000000000000000000000000000000000c0ffee0"], "pred": "keys-all" }
+  , "bad": { "keys": ["badc0de00000000000000000000000000000000000000000000000000badc0de"], "pred": "keys-all" } })
+
+(begin-tx "claim: unknown round rejected")
+(expect-failure "no such round" "No value found in table"
+  (free.pco-claim.claim "no-such-round"
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) "quest-1"))
+(rollback-tx)
+
+(begin-tx "claim: wrong code rejected")
+(expect-failure "wrong quest answer" "wrong engagement code"
+  (free.pco-claim.claim "quest-a"
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) "wrong-answer"))
+(rollback-tx)
+
+(begin-tx "claim: another round's code rejected (codes are per round)")
+(expect-failure "cross-round code" "wrong engagement code"
+  (free.pco-claim.claim "quest-a"
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) "quest-2"))
+(rollback-tx)
+
+(begin-tx "claim: not-yet-open round rejected")
+(expect-failure "early claim" "round has not opened yet"
+  (free.pco-claim.claim "quest-later"
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) "quest-2"))
+(rollback-tx)
+
+(begin-tx "claim: expired round rejected (in-contract close)")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-15T00:00:00Z") })
+(expect-failure "closes is exclusive" "round has closed"
+  (free.pco-claim.claim "quest-a"
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) "quest-1"))
+(rollback-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "claim: paused round rejected")
+(env-keys ["ledger-a"])
+(free.pco-claim.set-round-active "quest-a" false)
+(env-keys [])
+(expect-failure "inactive round" "round is not active"
+  (free.pco-claim.claim "quest-a"
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) "quest-1"))
+(rollback-tx)
+
+(begin-tx "claim: non-principal (vanity) account rejected")
+(expect-failure "vanity name rejected" "principal of its guard"
+  (free.pco-claim.claim "quest-a" "alice" (read-keyset 'cl) "quest-1"))
+(rollback-tx)
+
+(begin-tx "claim: guard/account mismatch rejected")
+(expect-failure "foreign guard on a k: name" "principal of its guard"
+  (free.pco-claim.claim "quest-a"
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'bad) "quest-1"))
+(rollback-tx)
+
+(begin-tx "claim: off-hub rejected")
+(env-chain-data { "chain-id": "6" })
+(expect-failure "claims are hub-only" "hub chain only"
+  (free.pco-claim.claim "quest-a"
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) "quest-1"))
+(rollback-tx)
+(env-chain-data { "chain-id": "0" })
+
+(begin-tx "claim: double claim in one round rejected; budget accounting holds")
+(free.pco-claim.claim "quest-a"
+  "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+  (read-keyset 'cl) "quest-1")
+(expect-failure "one claim per account per round" "already found"
+  (free.pco-claim.claim "quest-a"
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) "quest-1"))
+(rollback-tx)
+
+(begin-tx "claim: budget exhaustion")
+(env-keys ["ledger-a"])
+(free.pco-claim.create-round "one-slot" (hash "one") 100.0 100.0
+  (time "2026-08-01T00:00:00Z") (time "2026-08-15T00:00:00Z"))
+(env-keys [])
+(free.pco-claim.claim "one-slot"
+  "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+  (read-keyset 'cl) "one")
+(expect-failure "budget spent" "round budget exhausted"
+  (free.pco-claim.claim "one-slot"
+    "k:badc0de00000000000000000000000000000000000000000000000000badc0de"
+    (read-keyset 'bad) "one"))
+(rollback-tx)
+
+;; --- grants ---
+(begin-tx "grant: single NON-ops governance key insufficient")
+(env-keys ["ledger-b"])
+(expect-failure "1 non-ops key cannot grant" "ops authorization failed"
+  (free.pco-claim.grant
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) 1.0 "x"))
+(rollback-tx)
+
+(begin-tx "grant: bound sweep")
+(env-keys ["ledger-a"])
+(expect-failure "zero grant" "amount must be positive"
+  (free.pco-claim.grant
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) 0.0 "x"))
+(expect-failure "over-precise grant" "respect the token's precision"
+  (free.pco-claim.grant
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) 1.0000000000001 "x"))
+(expect-failure "grant above MAX-GRANT" "exceeds the per-grant bound"
+  (free.pco-claim.grant
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) 2000.000000000001 "x"))
+(expect-failure "empty reason" "a public reason is required"
+  (free.pco-claim.grant
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) 1.0 ""))
+(expect-failure "vanity receiver" "principal of its guard"
+  (free.pco-claim.grant "dana" (read-keyset 'cl) 1.0 "x"))
+(rollback-tx)
+
+(begin-tx "grant: off-hub rejected")
+(env-keys ["ledger-a"])
+(env-chain-data { "chain-id": "3" })
+(expect-failure "grants are hub-only" "hub chain only"
+  (free.pco-claim.grant
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) 1.0 "x"))
+(rollback-tx)
+(env-chain-data { "chain-id": "0" })
+
+(begin-tx "grant-batch: bounds + duplicate receiver + internal gate")
+(env-keys ["ledger-a"])
+(expect-failure "empty batch" "batch size must be 1-20"
+  (free.pco-claim.grant-batch []))
+(expect-failure "oversized batch" "batch size must be 1-20"
+  (free.pco-claim.grant-batch
+    (make-list 21
+      { "account": "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+      , "guard": (read-keyset 'cl), "amount": 1.0, "reason": "x" })))
+(expect-failure "duplicate receiver (install identity ignores amount)" "already installed"
+  (free.pco-claim.grant-batch
+    [ { "account": "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+      , "guard": (read-keyset 'cl), "amount": 1.0, "reason": "x" }
+    , { "account": "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+      , "guard": (read-keyset 'cl), "amount": 2.0, "reason": "y" } ]))
+(rollback-tx)
+
+(begin-tx "grant-internal is not callable from outside an OPS acquisition")
+(env-keys ["ledger-a"])
+(expect-failure "internal only" "require-capability: not granted"
+  (free.pco-claim.grant-internal
+    "k:c0ffee000000000000000000000000000000000000000000000000000c0ffee0"
+    (read-keyset 'cl) 1.0 "x"))
+(rollback-tx)
+
+;; --- pool escrow (module guard): nobody outside pco-claim, and no
+;;     INSUFFICIENT gov quorum, can move pool funds. A foreign spend falls through
+;;     to acquireModuleAdmin(pco-claim) -> gov keyset (keys-2). (The FULL keys-2
+;;     quorum retains a disclosed module-admin spend path — proven positively in
+;;     pco-claim.repl; it crosses no tier, since gov can sweep or upgrade anyway.)
+(begin-tx "pool: outside transfer-create rejected (module guard)")
+(env-data { "thief": { "keys": ["thief-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "thief-key"
+            , "caps": [(free.pco.TRANSFER (free.pco-claim.pool-account) "whale" 1.0)] } ])
+(expect-failure "module guard holds against outsiders" "Keyset failure"
+  (free.pco.transfer-create (free.pco-claim.pool-account) "whale" (read-keyset 'thief) 1.0))
+(rollback-tx)
+
+(begin-tx "pool: an insufficient gov quorum (1 of keys-2) cannot debit the pool")
+(env-sigs [ { "key": "ledger-a", "caps": [(free.pco.TRANSFER (free.pco-claim.pool-account) "whale" 1.0)] } ])
+(env-data { "x": { "keys": ["xk"], "pred": "keys-all" } })
+(expect-failure "module admin needs the full keys-2 quorum" "Keyset failure"
+  (free.pco.transfer-create (free.pco-claim.pool-account) "whale" (read-keyset 'x) 1.0))
+(rollback-tx)
+
+;; --- sweep ---
+(begin-tx "sweep: while open rejected")
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco-claim.set-open true)
+(expect-failure "close before sweeping" "close claiming before sweeping"
+  (free.pco-claim.sweep-pool "r:free.pco-gov" (keyset-ref-guard "free.pco-gov")))
+(rollback-tx)
+
+(begin-tx "sweep: non-admin rejected")
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco-claim.set-open false)
+(env-data { "att": { "keys": ["att-key"], "pred": "keys-all" } })
+(env-keys ["att-key"])
+(expect-failure "non-admin cannot sweep" "Keyset failure"
+  (free.pco-claim.sweep-pool "att-sink" (read-keyset 'att)))
+(rollback-tx)
+
+;; ===========================================================================
+;; MODULE `pco-gas-station`
+;; ===========================================================================
+
+(begin-tx "fund the station for withdraw negatives")
+(test-capability (coin.COINBASE))
+(coin.coinbase (free.pco-gas-station.station-account)
+  (free.pco-gas-station.create-gas-payer-guard) 3.0)
+;; Every case below is about the allowlist, the ceilings or the envelope keys.
+;; The sponsorship check binds the transaction's gas payer to the station FIRST,
+;; so without this the cases would all abort on the sender and pass for the
+;; wrong reason - proving nothing about the branch each one names.
+(env-chain-data { "sender": (free.pco-gas-station.station-account) })
+(commit-tx)
+
+(begin-tx "GAS_PAYER: cont transaction refused")
+(env-data { "tx-type": "cont", "exec-code": ["(free.pco-claim.claim \"r1\" \"k:x\" g \"c\")"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(expect-failure "exec only" "exec transactions only"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "GAS_PAYER: multi-call refused")
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco-claim.claim \"r1\" \"k:x\" g \"c\")" "(coin.transfer \"a\" \"b\" 1.0)"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(expect-failure "single call only" "exactly one call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "GAS_PAYER: unlisted call refused")
+(env-data { "tx-type": "exec", "exec-code": ["(coin.transfer \"a\" \"b\" 1.0)"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(expect-failure "not sponsored" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "GAS_PAYER: prefix-boundary attack refused")
+(env-data { "tx-type": "exec", "exec-code": ["(free.pco-claim.claimdrain \"k:x\")"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(expect-failure "trailing-space token boundary holds" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "GAS_PAYER: vote / propose / transfer are NOT sponsored (claim-only)")
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(env-data { "tx-type": "exec", "exec-code": ["(free.pco.cast-vote \"1\" \"k:x\" \"yes\")"] })
+(expect-failure "vote unsponsored" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(env-data { "tx-type": "exec", "exec-code": ["(free.pco.create-proposal \"t\" \"b\" [\"a\" \"b\"] 72)"] })
+(expect-failure "propose unsponsored" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(env-data { "tx-type": "exec", "exec-code": ["(free.pco.transfer \"k:x\" \"k:y\" 1.0)"] })
+(expect-failure "transfer unsponsored" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(env-data { "tx-type": "exec", "exec-code": ["(free.pco.transfer-crosschain \"k:x\" \"k:x\" g \"1\" 1.0)"] })
+(expect-failure "transfer-crosschain unsponsored" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "GAS_PAYER: price above ceiling refused (on the sponsored claim)")
+(env-data { "tx-type": "exec", "exec-code": ["(free.pco-claim.claim \"r1\" \"k:x\" g \"c\")"] })
+(env-chain-data { "gas-price": 0.000001, "gas-limit": 3000 })
+(expect-failure "gas price ceiling" "gas price must be <="
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.000001)))
+(rollback-tx)
+
+(begin-tx "GAS_PAYER: limit above ceiling refused (on the sponsored claim)")
+(env-data { "tx-type": "exec", "exec-code": ["(free.pco-claim.claim \"r1\" \"k:x\" g \"c\")"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 150000 })
+(expect-failure "gas limit ceiling" "gas limit must be <="
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 150000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "GAS_PAYER: missing injected fields fail closed")
+(env-data { "unrelated": true })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(expect-failure "no tx-type => no sponsorship" "read-msg failure"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "station guard: outsider with neither branch rejected")
+(env-keys ["outsider-key"])
+(expect-failure "neither gas-buy nor admin" "station guard"
+  (enforce-guard (free.pco-gas-station.create-gas-payer-guard)))
+(rollback-tx)
+
+(begin-tx "withdraw: foreign key cannot recover station funds")
+(env-data { "att": { "keys": ["att-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "att-key"
+            , "caps": [(coin.TRANSFER (free.pco-gas-station.station-account) "att-sink" 1.0)] } ])
+(expect-failure "station guard blocks a foreign withdraw" "station guard"
+  (free.pco-gas-station.withdraw "att-sink" 1.0))
+(rollback-tx)
+
+(begin-tx "withdraw: admin cannot pull more than the station holds")
+(env-data { "ops": { "keys": ["ops-key"], "pred": "keys-all" } })
+(coin.create-account "ops-sink" (read-keyset 'ops))
+(env-sigs [ { "key": "ledger-a"
+            , "caps": [(coin.TRANSFER (free.pco-gas-station.station-account) "ops-sink" 999.0)] }
+          , { "key": "ledger-b"
+            , "caps": [(coin.TRANSFER (free.pco-gas-station.station-account) "ops-sink" 999.0)] } ])
+(expect-failure "cannot overdraw the station" "Insufficient funds"
+  (free.pco-gas-station.withdraw "ops-sink" 999.0))
+(rollback-tx)
+
+(begin-tx "registry-admin/init: station init is one-shot (second create fails)")
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "station init is one-shot" "already found"
+  (free.pco-gas-station.init))
+(rollback-tx)
+
+;; ===========================================================================
+;; Mutation survivors from the 2026-07-29 audit. Each block below corresponds to
+;; a mutant that survived all 16 checks, i.e. a defence the suite could not tell
+;; was there.
+;; ===========================================================================
+
+;; --- C3: `transfer` must FAIL for a receiver that does not exist ------------
+;; fungible-v2 REQUIRES it: `transfer` credits an EXISTING account and
+;; `transfer-create` is the one that may create. The distinction is carried by a
+;; single `with-read` in the delegation path, and changing it to
+;; `with-default-read` survived every check - at which point `transfer` would
+;; silently create the receiver under the SENDER's guard, because that is the
+;; default it would fall back to. Anyone could then plant a balance in an account
+;; whose name they chose and whose guard they control.
+(begin-tx "C3: transfer (not transfer-create) to a nonexistent receiver is refused")
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER "whale" "ghost-receiver" 1.0)] } ])
+(expect-failure "transfer refuses a receiver that does not exist"
+  "No value found in table free.pco_accounts for key: ghost-receiver"
+  (free.pco.transfer "whale" "ghost-receiver" 1.0))
+(rollback-tx)
+
+(begin-tx "C3b: and it still refuses one after a failed attempt")
+(expect-failure "no row was created by the refusal"
+  "No value found in table free.pco_accounts for key: ghost-receiver"
+  (free.pco.get-balance "ghost-receiver"))
+(rollback-tx)
+
+;; --- C4: transfer-create must validate the RECEIVER's name ------------------
+;; Deleting `(validate-account receiver)` from transfer-create survived every
+;; check: receivers named "", "a" and a non-Latin-1 string were all credited.
+;; A name that no wallet can render, or a 1-character name, is a permanent
+;; unusable balance - and on the cross-chain path an unrenderable receiver is
+;; how a credit dies with no rollback.
+(begin-tx "C4: transfer-create refuses an EMPTY receiver name")
+(env-data { "gg": { "keys": ["gg-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER "whale" "" 1.0)] } ])
+(expect-failure "empty receiver name refused" "min length"
+  (free.pco.transfer-create "whale" "" (read-keyset 'gg) 1.0))
+(rollback-tx)
+
+(begin-tx "C4b: transfer-create refuses a receiver name below the minimum")
+(env-data { "gg": { "keys": ["gg-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER "whale" "a" 1.0)] } ])
+(expect-failure "1-character receiver refused" "min length"
+  (free.pco.transfer-create "whale" "a" (read-keyset 'gg) 1.0))
+(rollback-tx)
+
+(begin-tx "C4c: transfer-create refuses a receiver name above the maximum")
+(env-data { "gg": { "keys": ["gg-key"], "pred": "keys-all" } })
+(let ((long (fold (lambda (acc:string i:integer) (+ acc "x")) "" (enumerate 1 257))))
+  (env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER "whale" long 1.0)] } ])
+  (expect "the name really is over the 256 bound" 257 (length long))
+  (expect-failure "over-long receiver refused" "max length"
+    (free.pco.transfer-create "whale" long (read-keyset 'gg) 1.0)))
+(rollback-tx)
+
+(begin-tx "C4d: transfer-create refuses a NON-LATIN-1 receiver name")
+(env-data { "gg": { "keys": ["gg-key"], "pred": "keys-all" } })
+;; built via base64-decode so this file stays plain ASCII
+(let ((snowman (+ "snow-" (base64-decode "4piD"))))
+  (env-sigs [ { "key": "whale-key", "caps": [(free.pco.TRANSFER "whale" snowman 1.0)] } ])
+  (expect-failure "non-latin1 receiver refused" "does not conform to the token contract charset"
+    (free.pco.transfer-create "whale" snowman (read-keyset 'gg) 1.0)))
+(rollback-tx)
+
+;; --- C2: a NEW account opens at ZERO ---------------------------------------
+;; Changing create-account's opening balance from 0.0 to 1.0 survived every
+;; check. Two unsigned calls then made 2.0 PCO out of nothing, and because
+;; `chain-minted` reads the supply row rather than summing balances, the forgery
+;; was invisible to it. Nothing asserted the opening balance at all.
+(begin-tx "C2: a newly created account opens at exactly zero")
+(env-data { "fresh": { "keys": ["fresh-key"], "pred": "keys-all" } })
+(env-sigs [])
+(free.pco.create-account "fresh-account" (read-keyset 'fresh))
+(expect "a new account holds nothing" 0.0
+  (free.pco.get-balance "fresh-account"))
+(rollback-tx)
+
+(begin-tx "C2b: creating accounts cannot move the supply")
+(env-data { "f1": { "keys": ["f1-key"], "pred": "keys-all" }
+          , "f2": { "keys": ["f2-key"], "pred": "keys-all" } })
+(env-sigs [])
+(let ((before (free.pco.chain-minted)))
+  (free.pco.create-account "opened-one" (read-keyset 'f1))
+  (free.pco.create-account "opened-two" (read-keyset 'f2))
+  (expect "both opened at zero" 0.0
+    (+ (free.pco.get-balance "opened-one") (free.pco.get-balance "opened-two")))
+  (expect "and chain-minted did not move" before (free.pco.chain-minted)))
+(rollback-tx)
+
+;; --- C5: grant-internal is gated ONLY by require-capability (OPS) -----------
+;; Deleting that one line survived all 16 checks. It is the whole gate: Pact has
+;; no private functions, so `grant-internal` is a public entry point that moves
+;; tokens OUT OF THE COMMUNITY POOL. Without the require-capability any caller
+;; could award themselves up to MAX-GRANT per call, from a pool holding ~900,000
+;; PCO, with no signature at all.
+;;
+;; `require-capability` CHECKS scope rather than acquiring, so a caller who never
+;; obtained OPS is refused here — which is exactly what must be asserted, because
+;; nothing else in the function does it.
+(begin-tx "C5: grant-internal is refused without OPS in scope")
+(env-data { "thief": { "keys": ["thief-key"], "pred": "keys-all" } })
+(env-sigs [])
+(expect-failure "an unsigned caller cannot reach grant-internal"
+  "require-capability"
+  (free.pco-claim.grant-internal "k:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    (read-keyset 'thief) 2000.0 "self-award"))
+(rollback-tx)
+
+(begin-tx "C5b: and not even with the pool's own guard signed")
+;; the pool is module-guarded, so no key satisfies it; this asserts that holding
+;; keys is not the missing ingredient - the capability is.
+(env-data { "thief": { "keys": ["thief-key"], "pred": "keys-all" } })
+(env-keys ["thief-key", "ledger-a", "ledger-b"])
+(expect-failure "even the governance pair must go through grant, not grant-internal"
+  "require-capability"
+  (free.pco-claim.grant-internal "k:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    (read-keyset 'thief) 2000.0 "self-award"))
+(rollback-tx)
+
+(begin-tx "C5c: the POSITIVE control - the sanctioned path still works")
+;; Without this, C5/C5b would still pass if grant-internal were broken outright,
+;; and the refusals would prove nothing about the capability.
+(env-data { "ok-recv": { "keys": ["cafebabe00000000000000000000000000000000000000000000000000000001"], "pred": "keys-all" } })
+(env-keys ["ledger-a"])
+(expect "the ops tier can still award through the public grant"
+  "granted"
+  (free.pco-claim.grant "k:cafebabe00000000000000000000000000000000000000000000000000000001"
+    (read-keyset 'ok-recv) 10.0 "sanctioned award, positive control"))
+(rollback-tx)
+
+(print "negatives.repl: ALL NEGATIVE CASES FAILED AS EXPECTED")

@@ -1,0 +1,233 @@
+;; missing-tables.repl — what a chain does when one of its tables was never
+;; created, and which of those states governance can still get out of.
+;;
+;; WHY THIS FILE EXISTS. A fresh deploy creates every table, so every other
+;; suite in this repo runs on a chain where they all exist. But the deploy
+;; footer has an UPGRADE mode that touches nothing, and six tables were added
+;; after the first deploy (vote-delegates, rcv-proposals, rcv-ballots,
+;; rcv-actives, ops-auth, rcv-margins). A chain upgraded past those needs a
+;; one-off `(acquire-module-admin)(create-table ...)` per table - the documented
+;; P3b list - and until that lands the table is ABSENT.
+;;
+;; THE ENGINE FACT ALL OF THIS TURNS ON (measured on pact 5.4, 2026-07-29):
+;; a read against a table that does not exist raises
+;;   "Error during database operation: Table <ns>.pco_<t> not found"
+;; and that error is contained by NEITHER `try` NOR `enforce-one`. It aborts
+;; the whole enclosing predicate. `with-default-read` does NOT help: it covers
+;; a missing ROW, not a missing TABLE.
+;;
+;; Consequence for capability design, which is the whole point of this suite:
+;; if a gate reads a table BEFORE its enforce-one, that read runs before EITHER
+;; branch, and a branch that needed no table at all is never reached. Two
+;; capabilities in this codebase did exactly that and their own docstrings
+;; promised the opposite. This suite is what stops that coming back.
+;;
+;; One REPL holds one Pact DB, so a missing table cannot be faked by deleting a
+;; row - the variant has to be deployed without it. fixtures/make-missing-table-pco.sh
+;; generates the three variants from the REAL contracts/pco.pact (one omitted
+;; create-table each, verified to be the only change), and each is loaded into
+;; its OWN namespace because one REPL cannot hold two definitions of `pco` with
+;; different table sets.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin (pco references coin.VALID_CHAIN_IDS)")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+;; ===========================================================================
+;; PART 1 — a chain with NO `ops-auth`. Governance must keep full control.
+;;
+;; PROPOSAL-OPS (pco) and OPS (pco-claim) both offer two branches: the 2-of-3
+;; governance keyset, or the ops authority. Only the SECOND reads ops-auth.
+;; Both caps used to hoist that read into a `let` above the enforce-one, so on
+;; this chain the governance keyset was locked out of the master kill switch
+;; (set-open), create-round, grant and create-proposal - and set-ops-guard
+;; could not repair it because its write hits the same table.
+;; ===========================================================================
+(begin-tx "PART 1: deploy a pco with every table EXCEPT ops-auth")
+(env-data
+  { "ns": "nops", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "nops" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "nops")
+(define-keyset "nops.pco-gov" (read-keyset 'pco-gov))
+(load "fixtures/missing-ops-auth-pco.pact")
+(load "../contracts/pco-claim.pact")
+(nops.pco.init-mint
+  [ { "account": (nops.pco-claim.pool-account)
+    , "guard": (nops.pco-claim.pool-guard)
+    , "amount": 900000.0 }
+  , { "account": "r:nops.pco-gov"
+    , "guard": (keyset-ref-guard "nops.pco-gov")
+    , "amount": 100000.0 } ])
+(commit-tx)
+
+(begin-tx "P1a: the ops-tier read really is unavailable on this chain")
+(expect-failure "ops-guard cannot read a table that was never created"
+  "not found"
+  (nops.pco.ops-guard))
+(rollback-tx)
+
+(begin-tx "P1b: governance keeps the master kill switch (pco-claim.OPS)")
+(env-keys ["ledger-a", "ledger-b"])
+(expect "the governance pair still opens claims" "claims open"
+  (nops.pco-claim.set-open true))
+(commit-tx)
+
+(begin-tx "P1c: governance can still author a question (pco.PROPOSAL-OPS)")
+(env-keys ["ledger-a", "ledger-b"])
+(expect "the governance pair still opens a ranked-choice question" "1"
+  (nops.pco.create-proposal "still in control?" "body" ["a" "b"] 72))
+(commit-tx)
+
+(begin-tx "P1d: governance can still create a round (pco-claim.OPS)")
+(env-keys ["ledger-a", "ledger-b"])
+(expect "the governance pair still creates a round" "round round-1 created"
+  (nops.pco-claim.create-round "round-1" (hash "code") 100.0 30000.0
+    (time "2026-08-01T00:00:00Z") (time "2026-09-01T00:00:00Z")))
+(commit-tx)
+
+;; Fail-closed, still. A stranger is refused - here by the database error
+;; rather than by the enforce-one message, because branch 1 fails and branch 2
+;; cannot read. Both are refusals; what matters is that no unauthorized caller
+;; gets through on a degraded chain.
+(begin-tx "P1e: a stranger is still refused on this chain")
+(env-keys ["stranger"])
+(expect-failure "an unrelated key gets no ops authority from a missing table"
+  "Error during database operation: Table nops.pco_ops-auth not found"
+  (nops.pco-claim.set-open false))
+(rollback-tx)
+
+;; The honest limit: governance can OPERATE, but it cannot REPAIR the ops
+;; delegation from on-chain, because set-ops-guard writes to the absent table.
+;; The fix is the P3b admin tx, and this asserts that it is still needed.
+(begin-tx "P1f: the ops delegation still cannot be repaired on-chain")
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "set-ops-guard cannot write to a table that does not exist"
+  "not found"
+  (nops.pco.set-ops-guard (read-keyset 'pco-gov)))
+(rollback-tx)
+
+;; ===========================================================================
+;; PART 2 — a chain with NO `vote-delegates`. An owner must still vote.
+;;
+;; VOTE offers the account's MAIN guard or an ACTIVE registered vote key. Only
+;; the second reads vote-delegates. The cap used to read it in a `let*` above
+;; the enforce-one, so on this chain NOBODY could vote - not even with their
+;; own main account guard - while the docstring claimed the main guard was
+;; "tried FIRST, so a registration can never lock the owner out of voting".
+;; ===========================================================================
+(begin-tx "PART 2: deploy a pco with every table EXCEPT vote-delegates")
+(env-data
+  { "ns": "novd", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "whale": { "keys": ["whale-key"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "novd" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "novd")
+(define-keyset "novd.pco-gov" (read-keyset 'pco-gov))
+(load "fixtures/missing-vote-delegates-pco.pact")
+(novd.pco.init-mint
+  [ { "account": "whale", "guard": (read-keyset 'whale), "amount": 1000000.0 } ])
+(novd.pco.create-proposal "can anyone vote?" "body" ["a" "b"] 72)
+(commit-tx)
+
+(begin-tx "P2a: the vote-key read really is unavailable on this chain")
+(expect-failure "get-vote-key cannot read a table that was never created"
+  "not found"
+  (novd.pco.get-vote-key "whale"))
+(rollback-tx)
+
+(begin-tx "P2b: the owner still votes with their OWN main account guard")
+(env-sigs [ { "key": "whale-key", "caps": [(novd.pco.VOTE "1" "whale")] } ])
+(expect "a holder is not locked out of voting by an absent delegate table"
+  "vote recorded"
+  (novd.pco.cast-vote "1" "whale" [0]))
+(expect "and the ballot really landed" [0]
+  (at 'ranking (novd.pco.get-ballot "1" "whale")))
+(commit-tx)
+
+(begin-tx "P2c: a stranger still cannot vote for someone else")
+(env-sigs [ { "key": "stranger", "caps": [(novd.pco.VOTE "1" "whale")] } ])
+(expect-failure "an unrelated key is still refused"
+  "Error during database operation: Table novd.pco_vote-delegates not found"
+  (novd.pco.cast-vote "1" "whale" [1]))
+(rollback-tx)
+
+;; ===========================================================================
+;; PART 3 — a chain with NO `rcv-actives`. THIS ONE IS NOT FIXED IN CODE, and
+;; this part exists to prove exactly how bad it is, because that is the
+;; justification for the freeze-time table probe.
+;;
+;; Every debit calls release-votes, which calls open-ids, which reads
+;; rcv-actives. So on this chain EVERY balance decrease aborts: transfer,
+;; claim, grant - and sweep-pool, which is the documented recovery path for a
+;; stranded pool. Meanwhile pool-balance reads `accounts` and answers happily,
+;; so monitoring reports a healthy pool that cannot be moved.
+;;
+;; There is no code fix that would be honest here: the release IS required for
+;; correctness on every debit (it is what stops moved tokens voting twice), so
+;; it cannot be made optional. The mitigation is procedural and belongs at the
+;; freeze gate - after FROZEN-MODULE, create-table is impossible FOREVER and
+;; every exit from the pool is a debit, so this state becomes permanent.
+;; ===========================================================================
+(begin-tx "PART 3: deploy a pco with every table EXCEPT rcv-actives")
+(env-data
+  { "ns": "noact", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "whale": { "keys": ["whale-key"], "pred": "keys-all" }
+  , "sink": { "keys": ["sink-key"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "noact" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "noact")
+(define-keyset "noact.pco-gov" (read-keyset 'pco-gov))
+(load "fixtures/missing-rcv-actives-pco.pact")
+(load "../contracts/pco-claim.pact")
+(noact.pco.init-mint
+  [ { "account": (noact.pco-claim.pool-account)
+    , "guard": (noact.pco-claim.pool-guard)
+    , "amount": 900000.0 }
+  , { "account": "whale", "guard": (read-keyset 'whale), "amount": 100000.0 } ])
+(commit-tx)
+
+(begin-tx "P3a: monitoring reads a perfectly healthy pool")
+(expect "pool-balance answers, because it only reads `accounts`" 900000.0
+  (noact.pco-claim.pool-balance))
+(commit-tx)
+
+(begin-tx "P3b: but every ordinary debit is dead")
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(noact.pco.TRANSFER "whale" "sink" 1.0)] } ])
+(expect-failure "a plain transfer aborts: the release path reads rcv-actives"
+  "not found"
+  (noact.pco.transfer-create "whale" "sink" (read-keyset 'sink) 1.0))
+(rollback-tx)
+
+(begin-tx "P3c: and so is sweep-pool - the DOCUMENTED recovery path")
+(env-keys ["ledger-a", "ledger-b"])
+(expect-failure "the pool cannot be swept, so the recovery path is bricked too"
+  "not found"
+  (noact.pco-claim.sweep-pool "r:noact.pco-gov"
+    (keyset-ref-guard "noact.pco-gov")))
+(rollback-tx)
+
+(begin-tx "P3d: the balance is still there, and still unmovable")
+(expect "the pool still reports 900000 that nobody can move" 900000.0
+  (noact.pco-claim.pool-balance))
+(commit-tx)
+
+(print "missing-tables.repl: ALL TESTS PASSED")

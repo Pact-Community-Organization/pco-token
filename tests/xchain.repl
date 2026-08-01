@@ -1,0 +1,304 @@
+;; xchain.repl — the cross-chain defpact, both steps, in the REPL.
+;;
+;; WHY THIS FILE EXISTS. The other suites say the cross-chain resume is
+;; "DEVNET-ONLY (SPV)" and test only step 0. That is WRONG for Pact 5.4:
+;; `continue-pact` drives a defpact continuation in the REPL, and the 4-argument
+;; form injects the yielded object, so step 1 can be reached and its checks
+;; exercised without SPV. Verified 2026-07-29.
+;;
+;; The consequence of believing otherwise was a real hole: the step-1 credit's
+;; guard check and the TRANSFER_XCHAIN manager were covered by nothing, and a
+;; mutation audit killed neither. A second spend through the manager is the
+;; worst case here - it would move tokens twice against one signature.
+;;
+;; What SPV still buys on devnet: proof validation and the real two-chain
+;; plumbing. What it does not buy, and what this file covers, is the contract
+;; logic on either side of the yield.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "deploy + mint")
+(env-data
+  { "ns": "free", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "whale": { "keys": ["whale-key"], "pred": "keys-all" }
+  , "far":   { "keys": ["far-key"], "pred": "keys-all" }
+  , "other": { "keys": ["other-key"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(free.pco.init-mint
+  [ { "account": "whale", "guard": (read-keyset 'whale), "amount": 1000000.0 } ])
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; X-5 — the manager is ONE-SHOT. A cross-chain signature covers exactly one
+;; send; a second must be refused. If TRANSFER_XCHAIN-mgr returned the remaining
+;; amount instead of 0.0, one signature would move tokens twice.
+;; ---------------------------------------------------------------------------
+;; X-5 — WHAT ACTUALLY PREVENTS A SECOND SPEND, and why the obvious test does
+;; not exist here.
+;;
+;; A mutation audit changed TRANSFER_XCHAIN-mgr to return the remaining balance
+;; instead of 0.0 and no test died, which looked like a coverage hole. It is
+;; not. Investigated 2026-07-29:
+;;   * two sends cannot be attempted in one transaction - Pact refuses to start
+;;     a second defpact: "defpact execution context already in the environment";
+;;   * across transactions, each transaction installs the capability afresh from
+;;     the signature, so the manager's residual balance is irrelevant;
+;;   * `test-capability` cannot reach the manager either - it reports
+;;     "Capability already installed" and never calls it.
+;; So one-send-per-transaction is STRUCTURAL, enforced by the defpact machinery,
+;; and the `0.0` return is defence in depth behind it. The surviving mutant
+;; reflects that, not a missing test. Recorded rather than papered over with a
+;; test that would pass for the wrong reason - the failure mode this whole suite
+;; exists to correct.
+(begin-tx "X-5: a second defpact cannot start in the same transaction")
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "whale" "k:1111111111111111111111111111111111111111111111111111111111111111" 100.0 "1")] } ])
+(env-data { "rg": { "keys": ["1111111111111111111111111111111111111111111111111111111111111111"], "pred": "keys-all" } })
+(free.pco.transfer-crosschain "whale"
+  "k:1111111111111111111111111111111111111111111111111111111111111111"
+  (read-keyset 'rg) "1" 100.0)
+(expect "the send debited exactly once" 999900.0 (free.pco.get-balance "whale"))
+(expect-failure "a second cross-chain send in the same transaction is refused"
+  "defpact execution context already in the environment"
+  (free.pco.transfer-crosschain "whale"
+    "k:1111111111111111111111111111111111111111111111111111111111111111"
+    (read-keyset 'rg) "1" 100.0))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; X-3 — step 0 debits and yields; step 1 credits the yielded amount.
+;; ---------------------------------------------------------------------------
+(begin-tx "X-3: both steps, end to end")
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "whale" "k:2222222222222222222222222222222222222222222222222222222222222222" 250.0 "1")] } ])
+(env-data { "rg2": { "keys": ["2222222222222222222222222222222222222222222222222222222222222222"], "pred": "keys-all" } })
+(free.pco.transfer-crosschain "whale"
+  "k:2222222222222222222222222222222222222222222222222222222222222222"
+  (read-keyset 'rg2) "1" 250.0)
+(expect "step 0 debited the sender" 999750.0 (free.pco.get-balance "whale"))
+;; the continuation lands on the TARGET chain
+(env-chain-data { "chain-id": "1", "block-time": (time "2026-08-01T00:00:00Z") })
+(continue-pact 1)
+(expect "step 1 credited the receiver on the target chain" 250.0
+  (free.pco.get-balance "k:2222222222222222222222222222222222222222222222222222222222222222"))
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; X-4 — the step-1 CREDIT must refuse a guard mismatch. The receiver may
+;; already exist on the target chain under a different guard; crediting it
+;; regardless would hand the sender's tokens to whoever holds that account.
+;; The yielded object is injected so the mismatch can be constructed exactly.
+;; ---------------------------------------------------------------------------
+(begin-tx "X-4: step 1 refuses a receiver whose guard differs")
+;; the receiver already exists on the target chain, under 'other'
+(env-data { "other": { "keys": ["other-key"], "pred": "keys-all" } })
+(env-chain-data { "chain-id": "1", "block-time": (time "2026-08-01T00:00:00Z") })
+(free.pco.create-account "squatted-name" (read-keyset 'other))
+(commit-tx)
+
+(begin-tx "X-4: run the send, then resume with a mismatched guard")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "whale" "k:3333333333333333333333333333333333333333333333333333333333333333" 10.0 "1")] } ])
+(env-data { "rg3": { "keys": ["3333333333333333333333333333333333333333333333333333333333333333"], "pred": "keys-all" } })
+(free.pco.transfer-crosschain "whale"
+  "k:3333333333333333333333333333333333333333333333333333333333333333"
+  (read-keyset 'rg3) "1" 10.0)
+(env-chain-data { "chain-id": "1", "block-time": (time "2026-08-01T00:00:00Z") })
+;; inject a yield naming the SQUATTED account with the sender's guard
+(expect-failure "the credit refuses an existing account whose guard differs"
+  "account guard mismatch"
+  (continue-pact 1 false (at 'pactId (pact-state))
+    { "receiver": "squatted-name"
+    , "receiver-guard": (read-keyset 'rg3)
+    , "amount": 10.0
+    , "source-chain": "0" }))
+(rollback-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+;; ---------------------------------------------------------------------------
+;; The step-0 debit must release voted weight, exactly like a same-chain debit:
+;; tokens that have left this chain cannot keep voting on it.
+;; ---------------------------------------------------------------------------
+(begin-tx "vote weight is released when tokens leave the chain")
+(env-data { "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco.set-ops-guard (read-keyset 'pco-gov))
+(free.pco.create-proposal "xc" "does weight leave with the tokens?" ["a" "b"] 72)
+(env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE "1" "whale")] } ])
+(free.pco.cast-vote "1" "whale" [0])
+(expect "the whole balance is voting" 1000000.0
+  (at 'turnout (free.pco.get-proposal "1")))
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "whale" "k:4444444444444444444444444444444444444444444444444444444444444444" 400000.0 "1")] } ])
+(env-data { "rg4": { "keys": ["4444444444444444444444444444444444444444444444444444444444444444"], "pred": "keys-all" } })
+(free.pco.transfer-crosschain "whale"
+  "k:4444444444444444444444444444444444444444444444444444444444444444"
+  (read-keyset 'rg4) "1" 400000.0)
+(expect "turnout fell by exactly the amount that left" 600000.0
+  (at 'turnout (free.pco.get-proposal "1")))
+(rollback-tx)
+
+;; ===========================================================================
+;; A3 — the three supply-critical cross-chain assertions.
+;;
+;; Cross-chain was the weakest mutation region (44%), and these three mutants
+;; each survived all 16 checks while being able to BREAK SUPPLY:
+;;
+;;   M1  delete  (enforce (<= amount sb) "insufficient funds")   [pco.pact:683]
+;;   M2  widen   it to (<= amount (+ sb 1000000.0))              [pco.pact:683]
+;;   M3  tighten it to (< amount sb)                             [pco.pact:683]
+;;   M4  step 1's (+ b amount) -> amount                          [pco.pact:708]
+;;
+;; Why nothing caught them: negatives.repl:88 covers only the SAME-CHAIN
+;; insufficient-funds path, this file never attempted an over-balance send, and
+;; every credit test in it lands on an account at balance 0.0 - where
+;; "accumulate" and "overwrite" are indistinguishable. Proven consequence of M1
+;; in a scratch copy: an account holding 100 sent 5000, ended at -4900, and the
+;; target chain credited the full 5000 - invisible to chain-minted, because a
+;; cross-chain send never touches the supply row.
+;;
+;; TRANSFER_XCHAIN-mgr is no backstop: it bounds the send to the SIGNED amount,
+;; and the signer signs whatever they like - so every test below signs for the
+;; full amount it attempts, which is what an attacker would do.
+;;
+;; These run LAST and commit, because they need balances that persist across
+;; transactions; placing them earlier would disturb the whole-balance turnout
+;; assertion above.
+;;
+;; PROVEN KILLS (re-applied in a scratch copy 2026-07-29; each mutant makes
+;; `pact xchain.repl` exit NON-ZERO, which is what run.sh checks):
+;;
+;;   M1 delete :683   -> A3-1  "a cross-chain send larger than the balance is
+;;                             refused" (expected failure, got a yield)
+;;                     + A3-1  "the refused send debited NOTHING"  (got -4900.0)
+;;                     + A3-1b "still exactly 100 in a fresh transaction"
+;;   M2 widen  :683   -> the same three
+;;   M3 <= to  :683   -> A3-2  aborts outright at xchain.repl:230-232, because a
+;;                             legitimate exact-balance send now raises
+;;                             "insufficient funds"
+;;   M4 :708 overwrite-> A3-3  "the second credit ADDED to the existing balance
+;;                             (425), not replaced it (175)"  (got 175.0)
+;;
+;; The -4900.0 that A3-1 reports under M1 is the audit's figure reproduced
+;; independently: 100 held, 5000 sent, the target chain credited the full 5000,
+;; and chain-minted never moved.
+;;
+;; DETECTION NOTE, because it cost a false conclusion once: the Pact REPL keeps
+;; going after a failed `expect`/`expect-failure`, so the final
+;; (print "ALL TESTS PASSED") STILL RUNS on a failing file. Grepping for that
+;; line reports every mutant as a survivor. The exit code is the only reliable
+;; kill signal - use it, as run.sh does.
+;;
+;; MUTATE THE RIGHT LINE: `(enforce (<= amount sb) "insufficient funds")` and
+;; `(+ b amount)` each appear TWICE in pco.pact - the same-chain debit/credit at
+;; :569/:586 and the cross-chain ones at :683/:708. A non-global sed hits the
+;; same-chain pair, which this file is not supposed to cover (negatives.repl
+;; does), and the mutant then looks like a survivor here.
+;; ===========================================================================
+
+(begin-tx "A3 setup: an account holding exactly 100")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(env-data { "small": { "keys": ["small-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER "whale" "smallfry" 100.0)] } ])
+(free.pco.transfer-create "whale" "smallfry" (read-keyset 'small) 100.0)
+(expect "the small account holds exactly 100" 100.0 (free.pco.get-balance "smallfry"))
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; A3-1 — kills M1 (delete the bound) and M2 (widen it). An over-balance send
+;; must be REFUSED, and must debit nothing.
+;; ---------------------------------------------------------------------------
+(begin-tx "A3-1: an over-balance cross-chain send is refused and debits nothing")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(env-data { "rgA": { "keys": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "pred": "keys-all" } })
+(env-sigs [ { "key": "small-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "smallfry" "k:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" 5000.0 "1")] } ])
+(expect-failure "a cross-chain send larger than the balance is refused"
+  "insufficient funds"
+  (free.pco.transfer-crosschain "smallfry"
+    "k:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    (read-keyset 'rgA) "1" 5000.0))
+(expect "the refused send debited NOTHING" 100.0 (free.pco.get-balance "smallfry"))
+(commit-tx)
+
+;; A REPL expect-failure can leak writes through commit-tx, so the balance is
+;; re-read in a FRESH transaction: if the bound is gone, the debit survives the
+;; commit and this is where it shows up.
+(begin-tx "A3-1b: the refusal left no debit behind after the commit")
+(expect "still exactly 100 in a fresh transaction" 100.0 (free.pco.get-balance "smallfry"))
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; A3-2 — kills M3. The bound is <=, not <: a holder must be able to send their
+;; ENTIRE balance cross-chain. Tightening it to < strands every last token and
+;; no existing test notices.
+;; ---------------------------------------------------------------------------
+(begin-tx "A3-2: an exact-balance cross-chain send succeeds and drains to zero")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(env-data { "rgB": { "keys": ["bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"], "pred": "keys-all" } })
+(env-sigs [ { "key": "small-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "smallfry" "k:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" 100.0 "1")] } ])
+(free.pco.transfer-crosschain "smallfry"
+  "k:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  (read-keyset 'rgB) "1" 100.0)
+(expect "an exact-balance send is allowed and drains the account to zero" 0.0
+  (free.pco.get-balance "smallfry"))
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; A3-3 — kills M4. The step-1 credit must ACCUMULATE onto an existing balance.
+;; Every other credit test in this file lands on an empty account, where
+;; (+ b amount) and amount return the same number. The two amounts differ so
+;; overwrite (175.0) and accumulate (425.0) cannot be confused.
+;; ---------------------------------------------------------------------------
+(begin-tx "A3-3: first cross-chain credit to a fresh receiver")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(env-data { "rgC": { "keys": ["cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "whale" "k:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" 250.0 "1")] } ])
+(free.pco.transfer-crosschain "whale"
+  "k:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  (read-keyset 'rgC) "1" 250.0)
+(env-chain-data { "chain-id": "1", "block-time": (time "2026-08-01T00:00:00Z") })
+(continue-pact 1)
+(expect "the first credit lands on an empty account" 250.0
+  (free.pco.get-balance "k:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"))
+(commit-tx)
+
+(begin-tx "A3-3: a SECOND credit to the same receiver must ACCUMULATE, not overwrite")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(env-data { "rgC": { "keys": ["cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"], "pred": "keys-all" } })
+(env-sigs [ { "key": "whale-key"
+            , "caps": [(free.pco.TRANSFER_XCHAIN "whale" "k:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" 175.0 "1")] } ])
+(free.pco.transfer-crosschain "whale"
+  "k:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  (read-keyset 'rgC) "1" 175.0)
+(env-chain-data { "chain-id": "1", "block-time": (time "2026-08-01T00:00:00Z") })
+(continue-pact 1)
+(expect "the second credit ADDED to the existing balance (425), not replaced it (175)"
+  425.0
+  (free.pco.get-balance "k:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"))
+(commit-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(print "xchain.repl: ALL TESTS PASSED")

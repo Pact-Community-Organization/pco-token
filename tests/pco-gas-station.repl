@@ -1,0 +1,438 @@
+;; pco-gas-station.repl — gas station test suite.
+;;
+;; The sponsorship policy reads the transaction type and executed code as
+;; the node injects them (simulated here with env-data, proven injected on
+;; devnet), plus the (chain-data) gas envelope. Covers: the three-prefix
+;; allowlist with its trailing-space token boundary, exec-only, single-call,
+;; price/limit ceilings, meter accumulation, REAL epoch-cap exhaustion (833
+;; charges to the brink, the 834th refused), epoch roll, station guard
+;; (gas-buy path AND admin recovery path), and admin withdraw.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin")
+(env-hash (hash "station-tx-1"))
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "namespace + keyset + station")
+(env-hash (hash "station-tx-2"))
+(env-data
+  { "ns": "free"
+  , "upgrade": false
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco-gas-station.pact")
+(commit-tx)
+
+;; A sponsored transaction's gas payer IS the station - that is what makes it
+;; sponsored. The envelope check now binds to it, so the default context here
+;; mirrors a real gas buy; negative cases override `sender` explicitly.
+(env-chain-data { "sender": (free.pco-gas-station.station-account) })
+
+(expect "station account is a u: principal (user guard)" "u:"
+  (take 2 (free.pco-gas-station.station-account)))
+(expect "meter starts empty" 0.0 (free.pco-gas-station.epoch-spent))
+
+;; fund the station (10 KDA) for the withdraw tests
+(begin-tx "fund station")
+(env-hash (hash "station-tx-3"))
+(test-capability (coin.COINBASE))
+(coin.coinbase (free.pco-gas-station.station-account)
+  (free.pco-gas-station.create-gas-payer-guard) 10.0)
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; GAS_PAYER: the happy path (claim call, injected envelope, within bounds)
+;; ---------------------------------------------------------------------------
+(begin-tx "sponsors an allowlisted claim")
+;;   buy-gas phase = base64url(blake2b256("station-tx-4") ++ "-buygas")
+(env-hash "WJ26UxZdIY1VpmCeAbzX0UVnS_A7p_kInejnQU_CJ-ctYnV5Z2Fz")
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco-claim.claim \"r1\" \"k:abc\" (read-keyset 'ks) \"code\")"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(expect "GAS_PAYER grants" "()"
+  (format "{}" [(test-capability (free.pco-gas-station.GAS_PAYER "anyone" 3000 0.0000001))]))
+(expect "meter charged the actual worst case" 0.0003
+  (free.pco-gas-station.epoch-spent))
+;; With GAS + ALLOW_GAS in scope AND the transaction's gas payer set to the
+;; station, the station account guard releases through the GAS-PAYER branch.
+;; env-keys is emptied first: the governance keys left over from the deploy
+;; transaction would otherwise satisfy the enforce-one's ADMIN branch and this
+;; case would pass without ever exercising the branch it names.
+(env-keys [])
+(env-chain-data { "sender": (free.pco-gas-station.station-account)
+                , "gas-price": 0.0000001, "gas-limit": 3000 })
+(test-capability (coin.GAS))
+(expect "station guard satisfied inside a sanctioned gas buy" true
+  (enforce-guard (free.pco-gas-station.create-gas-payer-guard)))
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; `require-capability (ALLOW_GAS)` IS LOAD-BEARING, and nothing pinned it.
+;;
+;; Cold audit 2026-07-30: deleting that line from `gas-payer-pred` drained the
+;; float 50 -> 0 KDA with the whole suite still green. Both existing cases miss
+;; it, in opposite directions — the positive one holds ALLOW_GAS (composed by
+;; GAS_PAYER) so the requirement is satisfied and invisible, and the negative one
+;; fails EARLIER, at acquisition, because a self-paid caller cannot obtain
+;; ALLOW_GAS at all. Neither ever reaches the requirement, so deleting it changed
+;; nothing either could observe.
+;;
+;; This is the missing quadrant: sender binding SATISFIED, `coin.GAS` held, and
+;; ALLOW_GAS deliberately absent. Only the requirement can refuse here.
+;; ---------------------------------------------------------------------------
+(begin-tx "the gas-payer branch refuses without ALLOW_GAS, sender binding notwithstanding")
+(env-hash (hash "station-tx-4c"))
+;; Emptied so the enforce-one's ADMIN branch cannot satisfy the guard instead —
+;; the deploy transaction's governance keys would otherwise make this pass for
+;; the wrong reason, which is exactly how the gap survived.
+(env-keys [])
+(env-chain-data { "sender": (free.pco-gas-station.station-account)
+                , "gas-price": 0.0000001, "gas-limit": 3000 })
+(test-capability (coin.GAS))
+;; The message is the enforce-one aggregate, not the inner `require-capability`
+;; failure — enforce-one masks which branch failed and why. That is fine for this
+;; assertion (with the requirement deleted the branch SUCCEEDS and the guard
+;; returns true, so the expectation flips) but it is worth naming: no test here
+;; can distinguish WHICH of the gas-payer branch's checks refused.
+(expect-failure "the guard refuses when ALLOW_GAS was never acquired"
+  "station guard: neither gas-payer nor admin satisfied"
+  (enforce-guard (free.pco-gas-station.create-gas-payer-guard)))
+(rollback-tx)
+
+;; The SENDER BINDING is what makes the two capabilities above meaningful.
+;; Same capabilities, same forged envelope - but the transaction pays its own
+;; gas, so its sender is not the station. This is the shape of the drain that
+;; used to empty the float, and it must fail.
+(begin-tx "gas-payer branch refuses when the tx is not paying FROM the station")
+(env-hash (hash "station-tx-4b"))
+(env-keys [])
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco-claim.claim \"r1\" \"k:abc\" (read-keyset 'ks) \"code\")"] })
+(env-chain-data { "sender": "attacker-acct"
+                , "gas-price": 0.0000001, "gas-limit": 3000 })
+(test-capability (coin.GAS))
+;; The binding now sits in the shared envelope check, so a self-paid caller
+;; cannot even ACQUIRE ALLOW_GAS - it fails one step earlier than the guard.
+(expect-failure "ALLOW_GAS is unobtainable outside a transaction this station pays for"
+  "not a transaction paid for by this station"
+  (test-capability (free.pco-gas-station.ALLOW_GAS)))
+;; ...and charging the meter is likewise unreachable, which is what keeps the
+;; epoch cap meaningful. There is deliberately NO separate METER capability any
+;; more: its body was only the sponsorship envelope, which is a trust anchor
+;; during the gas-buy phase and nothing more. `charge-meter` is now gated on
+;; ALLOW_GAS, which is single-use per transaction, so one sponsored transaction
+;; advances the meter exactly once.
+(expect-failure "charge-meter is unreachable, so the epoch cap cannot be burned for free"
+  "require-capability"
+  (free.pco-gas-station.charge-meter))
+;; ...and with neither capability the station guard refuses outright.
+(expect-failure "a self-paid transaction cannot open the station guard"
+  "station guard"
+  (enforce-guard (free.pco-gas-station.create-gas-payer-guard)))
+(rollback-tx)
+;; env-chain-data survives rollback-tx, so put the sponsored context back for
+;; the cases below (they are about the allowlist and the meter, not the sender).
+(env-chain-data { "sender": (free.pco-gas-station.station-account) })
+
+;; ---------------------------------------------------------------------------
+;; ONLY the claim is sponsored — vote / propose / transfer are NOT (they need
+;; holdings; the participant pays their own gas). Onboarding-only by design.
+;; ---------------------------------------------------------------------------
+(begin-tx "vote is NOT sponsored")
+;;   buy-gas phase = base64url(blake2b256("station-tx-5") ++ "-buygas")
+(env-hash "tyNkrBa7Ob3PR4npo1i_8tT1dn1KNgIdkQ2E2KNdYoMtYnV5Z2Fz")
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco.cast-vote \"1\" \"k:abc\" \"yes\")"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 2000 })
+(expect-failure "vote not on the allowlist" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "anyone" 2000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "propose is NOT sponsored")
+;;   buy-gas phase = base64url(blake2b256("station-tx-6") ++ "-buygas")
+(env-hash "-eouROjmLrYarT2OI3UV_CJZnyPEYzzehpNn5rRvD5YtYnV5Z2Fz")
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco.create-proposal \"k:abc\" \"t\" \"b\" 72)"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 2000 })
+(expect-failure "propose not on the allowlist" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "anyone" 2000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "transfer is NOT sponsored")
+;;   buy-gas phase = base64url(blake2b256("station-tx-7") ++ "-buygas")
+(env-hash "yHCwgcVRDvpSZqSy41ux-dSzbldt_V6YZOPuvjB-sw4tYnV5Z2Fz")
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco.transfer \"k:abc\" \"k:def\" 1.0)"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 2000 })
+(expect-failure "transfer not on the allowlist" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "anyone" 2000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "transfer-create is NOT sponsored")
+;;   buy-gas phase = base64url(blake2b256("station-tx-8") ++ "-buygas")
+(env-hash "0mXIBioyGgvcoFCSQDQiwuV9bKHvWF621OwMcNY1SfMtYnV5Z2Fz")
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco.transfer-create \"k:abc\" \"k:def\" (read-keyset 'g) 1.0)"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 2000 })
+(expect-failure "transfer-create not on the allowlist" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "anyone" 2000 0.0000001)))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; Refusals: type, multi-call, unlisted code, boundary attack, ceilings
+;; ---------------------------------------------------------------------------
+(begin-tx "cont transactions refused")
+;;   buy-gas phase = base64url(blake2b256("station-tx-9") ++ "-buygas")
+(env-hash "SMWfe86gUgIlEgnV-zI73_t4TEB_puRo9UNrocUIr70tYnV5Z2Fz")
+(env-data { "tx-type": "cont"
+          , "exec-code": ["(free.pco-claim.claim \"r1\" \"k:abc\" g \"code\")"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(expect-failure "exec only" "exec transactions only"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "second smuggled call refused")
+;;   buy-gas phase = base64url(blake2b256("station-tx-10") ++ "-buygas")
+(env-hash "J5a3sOlkuEWUZVYoCOxnuwlMAeeGSxzR1UOMgJlz-EotYnV5Z2Fz")
+(env-data { "tx-type": "exec"
+          , "exec-code": [ "(free.pco-claim.claim \"r1\" \"k:abc\" g \"code\")"
+                         , "(coin.transfer \"a\" \"b\" 1.0)" ] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(expect-failure "single call only" "exactly one call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "unlisted call refused")
+;;   buy-gas phase = base64url(blake2b256("station-tx-11") ++ "-buygas")
+(env-hash "yLIhmC3AYiGDdsw1H9JgvD0vhKdSkJcnCdoC9t-lRAYtYnV5Z2Fz")
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(coin.transfer \"a\" \"b\" 1.0)"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(expect-failure "not sponsored" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "prefix boundary attack refused")
+;;   buy-gas phase = base64url(blake2b256("station-tx-12") ++ "-buygas")
+(env-hash "gAedDi6-TBZbNAtLmiTUE4voDG2rPYGKSr5lPtkAUBUtYnV5Z2Fz")
+;; a function whose NAME extends an allowlisted one must not match:
+;; the registered prefix ends with a space, "claimdrain" does not contain it.
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco-claim.claimdrain \"k:abc\")"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(expect-failure "token boundary holds" "not a sponsored call"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "price above ceiling refused")
+;;   buy-gas phase = base64url(blake2b256("station-tx-13") ++ "-buygas")
+(env-hash "mmDkCb0IY2NlWEQS-07iNllNAxSCyRIo8g6pqJSKED8tYnV5Z2Fz")
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco-claim.claim \"r1\" \"k:abc\" g \"code\")"] })
+(env-chain-data { "gas-price": 0.000001, "gas-limit": 3000 })
+(expect-failure "price ceiling" "gas price must be <="
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.000001)))
+(rollback-tx)
+
+(begin-tx "limit above ceiling refused")
+;;   buy-gas phase = base64url(blake2b256("station-tx-14") ++ "-buygas")
+(env-hash "g9ehyfvsPaR9kKFHbobU7vhDqnGQXiXDz8R4c6tOPRotYnV5Z2Fz")
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco-claim.claim \"r1\" \"k:abc\" g \"code\")"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 150000 })
+(expect-failure "limit ceiling" "gas limit must be <="
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 150000 0.0000001)))
+(rollback-tx)
+
+(begin-tx "missing injected fields fail closed")
+;;   buy-gas phase = base64url(blake2b256("station-tx-15") ++ "-buygas")
+(env-hash "_3H8Krkc1-5Y30ayIs0vFz_e5LS8limzZOLt3n-BQHQtYnV5Z2Fz")
+(env-data { "something-else": true })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 3000 })
+(expect-failure "no tx-type, no sponsorship" "read-msg failure"
+  (test-capability (free.pco-gas-station.GAS_PAYER "x" 3000 0.0000001)))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; Epoch cap: real exhaustion at the boundary, then the roll heals it
+;; ---------------------------------------------------------------------------
+;; ONE sponsored transaction advances the meter EXACTLY ONCE. This is the
+;; property the epoch cap depends on, and it is the one the old version of this
+;; block silently denied: it looped 832 acquisitions inside a single transaction
+;; on a single hash, which the engine can never do (one gas buy per transaction)
+;; and which the contract now refuses outright.
+;;   payload = (hash "station-tx-16"); buy-gas = base64url(raw ++ "-buygas")
+(begin-tx "one sponsored transaction, one charge")
+(env-hash "950e9qNtfvVlDFy8WLdtZQnuRNzxbFtg5AdeeOPTpwYtYnV5Z2Fz")
+(expect "buy-gas phase hash" 52 (length (tx-hash)))
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco-claim.claim \"r1\" \"k:abc\" g \"code\")"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 6000 })
+(let ((before (free.pco-gas-station.epoch-spent)))
+  (test-capability (free.pco-gas-station.GAS_PAYER "one" 6000 0.0000001))
+  (expect "the charge is exactly gas-price * gas-limit"
+    0.0006 (- (free.pco-gas-station.epoch-spent) before)))
+;; WHY THE OLD 832-CHARGE LOOP WAS POSSIBLE, recorded so nobody rebuilds it.
+;; ALLOW_GAS takes no arguments, so it is ONE capability instance per
+;; transaction: its body runs on the first acquisition and not again, and
+;; `charge-meter` only requires it to be IN SCOPE. So repeated GAS_PAYER
+;; acquisitions with distinct arguments each re-charged the meter while
+;; ALLOW_GAS's body — the check — ran exactly once. A second acquisition here
+;; therefore does NOT raise the single-use error; it charges again.
+(let ((before2 (free.pco-gas-station.epoch-spent)))
+  (test-capability (free.pco-gas-station.GAS_PAYER "two" 6000 0.0000001))
+  (expect "a second simulated gas buy charges the meter AGAIN in one transaction"
+    0.0006 (- (free.pco-gas-station.epoch-spent) before2)))
+;; That is a property of simulating two gas buys in one transaction, which
+;; chainweb never does: it performs exactly ONE gas buy per transaction, and
+;; the payload phase cannot acquire ALLOW_GAS at all (the phase test). The
+;; adversarial suite for this lives in the private ceremony repository.
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; The cap boundary. Reaching 0.5 honestly needs 833 sponsored transactions
+;; (0.5 / (6000 * 1e-7)), which cannot be expressed in Pact code because
+;; `env-hash` is a REPL directive and each transaction needs its own. So the
+;; meter is SEEDED to the brink under module admin - a test-only shortcut,
+;; stated plainly rather than faked with a loop that misrepresents the engine -
+;; and the boundary itself is then exercised for real.
+;; ---------------------------------------------------------------------------
+(begin-tx "seed the meter to the brink (module admin: test-only)")
+(env-keys ["ledger-a", "ledger-b"])
+(acquire-module-admin free.pco-gas-station)
+;; one charge (0.0006) short of the cap, so the NEXT charge lands exactly on it
+(update free.pco-gas-station.meter "meter"
+  { "epoch-start": (at 'block-time (chain-data)), "spent": 0.4994 })
+(commit-tx)
+
+(begin-tx "the last charge that fits lands exactly on the cap")
+;;   buy-gas = base64url(blake2b256("station-tx-16b") ++ "-buygas")
+(env-hash "ZLFt7CI-p3yi58n01DVgBZqalygvTJ3dzYmR-buI2UctYnV5Z2Fz")
+(env-keys [])
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco-claim.claim \"r1\" \"k:abc\" g \"code\")"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 6000 })
+(test-capability (free.pco-gas-station.GAS_PAYER "brink" 6000 0.0000001))
+;; the bound is <=, so exactly EPOCH-CAP is allowed - the boundary itself, not
+;; one unit inside it
+(expect "meter exactly at the cap" 0.5 (free.pco-gas-station.epoch-spent))
+(commit-tx)
+
+(begin-tx "and the one after it is refused")
+;;   payload = (hash "station-tx-18"); buy-gas = base64url(raw ++ "-buygas")
+(env-hash "5joZyCm8BIAhrFs2T-fiwHOXiFN1J2NBWxokePubnT8tYnV5Z2Fz")
+(env-keys [])
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco-claim.claim \"r1\" \"k:abc\" g \"code\")"] })
+(env-chain-data { "gas-price": 0.0000001, "gas-limit": 6000 })
+(expect-failure "the epoch cap refuses the next sponsored transaction"
+  "epoch cap reached"
+  (test-capability (free.pco-gas-station.GAS_PAYER "straw" 6000 0.0000001)))
+(expect "and nothing was charged for the refusal" 0.5
+  (free.pco-gas-station.epoch-spent))
+(rollback-tx)
+
+(begin-tx "the epoch rolls a day later")
+;;   buy-gas phase = base64url(blake2b256("station-tx-17") ++ "-buygas")
+(env-hash "NzN4LK21J359NE55wYozQ65E5MFm_qYqDaSyy-ellXQtYnV5Z2Fz")
+(env-chain-data { "block-time": (time "2026-08-02T00:00:01Z")
+                , "gas-price": 0.0000001, "gas-limit": 6000 })
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(free.pco-claim.claim \"r1\" \"k:abc\" g \"code\")"] })
+(test-capability (free.pco-gas-station.GAS_PAYER "fresh" 6000 0.0000001))
+(expect "meter reset to this tx's charge" 0.0006 (free.pco-gas-station.epoch-spent))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; Station guard: no free withdrawal; admin recovery works
+;; ---------------------------------------------------------------------------
+(begin-tx "guard refuses outside a gas buy without admin")
+(env-hash (hash "station-tx-18"))
+(env-keys ["attacker-key"])
+(expect-failure "neither branch satisfied" "station guard"
+  (enforce-guard (free.pco-gas-station.create-gas-payer-guard)))
+(rollback-tx)
+
+(begin-tx "attacker cannot withdraw")
+(env-hash (hash "station-tx-19"))
+(env-data { "attacker": { "keys": ["attacker-key"], "pred": "keys-all" } })
+(env-sigs [ { "key": "attacker-key"
+            , "caps": [(coin.TRANSFER (free.pco-gas-station.station-account) "attacker-sink" 5.0)] } ])
+(expect-failure "station guard blocks a foreign withdraw" "station guard"
+  (free.pco-gas-station.withdraw "attacker-sink" 5.0))
+(rollback-tx)
+
+(begin-tx "admin recovers residual funds")
+(env-hash (hash "station-tx-20"))
+(env-data { "ops": { "keys": ["ops-key"], "pred": "keys-all" } })
+(coin.create-account "ops-sink" (read-keyset 'ops))
+(env-sigs [ { "key": "ledger-a"
+            , "caps": [(coin.TRANSFER (free.pco-gas-station.station-account) "ops-sink" 5.0)] }
+          , { "key": "ledger-b"
+            , "caps": [(coin.TRANSFER (free.pco-gas-station.station-account) "ops-sink" 5.0)] } ])
+(free.pco-gas-station.withdraw "ops-sink" 5.0)
+(expect "recovered" 5.0 (coin.get-balance "ops-sink"))
+(commit-tx)
+
+;; ---------------------------------------------------------------------------
+;; FOREIGN-MODULE RESISTANCE — a module we do not control cannot obtain
+;; ALLOW_GAS and drain the station.
+;;
+;; The rule this encodes: holding a capability is never the authorization. A
+;; caller that has somehow obtained ALLOW_GAS still gets nothing, because the
+;; capability re-runs the sponsorship policy in its own body rather than
+;; assuming that whoever holds it was entitled to it. The same applies to any
+;; capability defined outside this module: we make no assumption about how
+;; readily one can be obtained, so requiring one is never sufficient on its own.
+;; ---------------------------------------------------------------------------
+(begin-tx "define a foreign attacker module in its OWN namespace")
+(env-hash (hash "station-tx-21"))
+(env-data { "evil": { "keys": ["attacker"], "pred": "keys-all" } })
+(env-keys ["attacker"])
+(define-namespace "gsevil" (read-keyset 'evil) (read-keyset 'evil))
+(namespace "gsevil")
+(define-keyset "gsevil.ks" (read-keyset 'evil))
+(module gs-evil GOV
+  (defcap GOV () (enforce-keyset "gsevil.ks"))
+  ;; forge the station's release caps via compose, then try to pass the guard
+  (defcap FORGE ()
+    (compose-capability (coin.GAS))
+    (compose-capability (free.pco-gas-station.ALLOW_GAS)))
+  (defun drain-guard-check:bool ()
+    (with-capability (FORGE)
+      (enforce-guard (free.pco-gas-station.create-gas-payer-guard)))))
+(commit-tx)
+
+(begin-tx "forge ALLOW_GAS for a NON-sponsored (drain) call -> refused")
+(env-hash (hash "station-tx-22"))
+;; the attacker's own tx envelope: a drain, not a sponsored claim
+(env-data { "tx-type": "exec"
+          , "exec-code": ["(coin.transfer (free.pco-gas-station.station-account) \"attacker\" 999.0)"] })
+(env-keys ["attacker"])
+(expect-failure "ALLOW_GAS body re-runs the policy: not a sponsored call"
+  "not a sponsored call"
+  (gsevil.gs-evil.drain-guard-check))
+(rollback-tx)
+
+(begin-tx "forge ALLOW_GAS with NO injected envelope -> fails closed")
+(env-hash (hash "station-tx-23"))
+(env-data {})
+(env-keys ["attacker"])
+(expect-failure "no sponsorship envelope -> read-msg fails closed"
+  "read-msg failure"
+  (gsevil.gs-evil.drain-guard-check))
+(rollback-tx)
+
+(print "pco-gas-station.repl: ALL TESTS PASSED")

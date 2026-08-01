@@ -1,0 +1,44 @@
+;; namespace-attack.repl — EXPECTED TO FAIL. The runner asserts that loading
+;; this file exits non-zero with "Keyset failure": an attacker key must not
+;; be able to install a module inside the community's principal namespace
+;; (the namespace user guard - the 2-of-3 keyset - gates every definition).
+;; Mainnet-faithful setup: the byte-true mainnet ns module is the namespace
+;; policy and RequireKeysetNs is on.
+
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(env-exec-config [])
+
+(begin-tx "genesis")
+(env-data
+  { "ns-admin-keyset":   { "keys": ["ns-admin-key"],   "pred": "keys-all" }
+  , "ns-operate-keyset": { "keys": ["ns-operate-key"], "pred": "keys-all" } })
+(env-keys ["ns-admin-key", "ns-operate-key"])
+(define-keyset "ns-admin-keyset" (read-keyset 'ns-admin-keyset))
+(define-keyset "ns-operate-keyset" (read-keyset 'ns-operate-keyset))
+(load "fixtures/mainnet-ns.pact")
+(create-table ns.registry)
+(commit-tx)
+
+(env-namespace-policy false (ns.validate))
+(env-exec-config ["RequireKeysetNs"])
+
+(env-data { "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+
+(begin-tx "the community namespace")
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace (ns.create-principal-namespace (read-keyset 'pco-gov))
+  (read-keyset 'pco-gov) (read-keyset 'pco-gov))
+(commit-tx)
+
+(begin-tx "the attack: module install under a foreign key MUST FAIL here")
+(env-keys ["attacker-key"])
+(namespace (ns.create-principal-namespace (read-keyset 'pco-gov)))
+(module squatter GOV
+  ;; unsatisfiable on purpose - this fixture must die at the NAMESPACE
+  ;; guard, before module governance is ever consulted
+  (defcap GOV () (enforce false "attack fixture"))
+  (defun hi:integer () 42))
+(commit-tx)
+
+;; If execution ever reaches this line, the namespace guard is broken.
+(print "NAMESPACE GUARD BROKEN - ATTACKER INSTALLED A MODULE")
