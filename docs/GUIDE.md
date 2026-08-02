@@ -12,18 +12,21 @@ organization's hardware-held keysets.
 
 ## 1. Choose your wallet — one active identity
 
-The token page uses **one active wallet at a time**: claims land there, balances show for it,
-votes and transfers come from it. Never two identities at once — switching wallets switches
-everything. Four options:
+The token page uses **one active wallet at a time**: balances show for it, votes and transfers
+come from it. Never two identities at once — switching wallets switches everything.
+
+**Claiming needs no wallet at all.** A claim carries no signature from you, so you can paste any
+`k:` address into the receiving-address field and claim straight to it — the route for a hardware
+wallet kept in a safe, or a browser that cannot reach your wallet. A wallet is only needed for the
+self-paid actions: transfers, voting, and guard rotation. Three options:
 
 | Option | What it is | Notes |
 |---|---|---|
-| **In-browser key** | A keypair generated inside your browser (the default) | Zero setup — perfect for a first claim. **Download the key backup**: the key lives only in that browser's storage. |
-| **EckoWallet** | Browser extension | Must be on the site's network (see §2 note) |
-| **Zelcore** | Desktop app | Log in first; the site talks to its local signing API |
+| **EckoWallet** | Browser extension | Must be on Kadena Mainnet — it is built in, no custom network needed |
+| **Zelcore** | Desktop app | Log in first; the site talks to its local signing API. **Not available in Safari**, which blocks pages from reaching local apps — use Chrome, Brave or Edge, or claim with no wallet |
 | **Ledger** | Hardware, via WebHID | Chrome/Edge/Brave; Kadena app open. The page asks the device to **display** the transaction so you can check it on-screen. Leave "blind signing" **off** — if the device ever shows only a hash it cannot tell you what you are approving, and the page will warn you before continuing |
 
-## 2. Claim — free, with any wallet
+## 2. Claim — free, with or without a wallet
 
 Claiming is the one action whose gas is **sponsored** by the on-chain gas station — and your
 wallet never signs for it (claims need no signature from the claimer; tokens can only land in
@@ -31,7 +34,12 @@ the account bound to the supplied guard). So even a Ledger claim needs no device
 
 1. Pick the open claim round and answer its quest. Quests are published on the PCO channels
    together with the round id; the answer, normalized to lowercase, is the claim code.
-2. Claim. The gas station pays the fee; tokens land in your **active wallet's** account.
+2. Claim. The gas station pays the fee; tokens land in the **receiving address** — your active
+   wallet's account by default, or whatever `k:` address you typed there.
+
+Most wallets list only KDA and well-known tokens, so yours may show nothing after a successful
+claim. That is a wallet display limit, not a missing balance: the token page reads the balance
+from the chain itself and shows the transaction id, which you can check against any Kadena node.
 
 On-chain rules that keep this fair: **one claim per account per round**, a fixed budget per round,
 and a time window — when a round's budget is exhausted or its window closes, the round is over.
@@ -145,6 +153,8 @@ principal accounts safe to send to. It applies to the community reserve (`r:`) a
 
 - Official rounds exist on-chain before they are announced anywhere. We never direct-message
   claim links, and there is nothing to buy — ever.
-- The claim page never asks for a seed phrase. The in-browser key is generated locally; back it
-  up and treat the backup like a password.
+- The claim page **never asks for a seed phrase or a private key, and never generates one for
+  you**. There is no key to back up, import, or lose. Every signature comes from a wallet you
+  already control. Any page asking you to paste key material is not ours — including one that
+  looks exactly like this.
 - Round budgets bound worst-case abuse; one-claim-per-account-per-round is the on-chain rule.
