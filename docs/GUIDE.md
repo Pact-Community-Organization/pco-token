@@ -38,10 +38,11 @@ and a time window — when a round's budget is exhausted or its window closes, t
 
 Everything beyond claiming is **self-paid**: your active wallet signs and pays a little KDA gas.
 
-**EckoWallet network setup (devnet preview):** the preview build points at a local development
-network. In EckoWallet: *Settings → Networks → add* — Name `PCO devnet`, URL `http://localhost:8090`,
-Network ID `recap-development` — save it and select it as the active network, then reconnect.
-(The launch build will point at Kadena mainnet, where no setup is needed.)
+**Wallet setup: none needed.** PCO is deployed on **Kadena mainnet**, which every Kadena wallet
+ships as a built-in network — just connect. If a wallet reports the wrong network, switch it to
+Mainnet; never add a custom network for PCO. The token lives in the namespace
+`n_57fcd6f7b72e8949af51a8d6f17fe12cc7719d10`, a *principal* namespace derived from the governance
+keyset, so it cannot be impersonated by a look-alike.
 
 ## 3. What is sponsored and what you pay
 
@@ -66,10 +67,9 @@ Network ID `recap-development` — save it and select it as the active network, 
 
   On Kadena mainnet the second step is normally completed for you by the public cross-chain gas
   relay, so in practice it finishes on its own within a few minutes. That relay is a public service,
-  not part of this contract: it is a liveness convenience, not a guarantee. **On the devnet preview
-  no such relay exists, so a cross-chain send there stays half-finished until the continuation is
-  submitted by hand.** Anyone can submit it — the continuation needs no signature from you, only
-  gas on the target chain.
+  not part of this contract: it is a liveness convenience, not a guarantee. If it does not run, the
+  send stays half-finished until the continuation is submitted by hand. Anyone can submit it — the
+  continuation needs no signature from you, only gas on the target chain.
 
 ## 5. Governance — ranked-choice voting on admin-authored questions {#voting}
 
