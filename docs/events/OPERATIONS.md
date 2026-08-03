@@ -29,8 +29,13 @@ limit, not a solvency check — see §5).
    `sweep-pool` is likewise always the LAST keyset-gated call in its transaction.
 2. **Never put a plaintext quest code in transaction code.** Compute the hash off-chain
    (`pact> (hash "the-code")`) and pass the hash. Transaction code is permanently public.
-3. **A batch pays each receiver at most once** (the transfer-capability identity ignores the
-   amount). Consolidate a person's awards into one item before building the batch.
+3. **A duplicate receiver ABORTS THE WHOLE BATCH** — it does not quietly pay once. The managed
+   transfer-capability install identity ignores the amount, so the second install for the same
+   account fails with `already installed`, and `grant-batch` is atomic: every item is rolled
+   back and every device approval in that transaction is wasted. Proven by
+   `tests/pco-claim.repl:506` and `tests/negatives.repl:766`. Consolidate a person's awards into
+   ONE item before building the batch — the action is the same as the old wording implied, but
+   the failure you are avoiding is a lost signing session, not an underpayment.
 4. **Every announcement carries the round id**, and codes are never posted before their round
    opens (governance reading-quest codes exist ONLY inside the proposal body; community-call
    codes are spoken, never typed).
