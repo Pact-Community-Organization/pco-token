@@ -15,5 +15,12 @@ if (process.argv[4]) {
 const chains = where === 'all' ? CHAINS : [where ?? HUB];
 for (const ch of chains) {
   try { console.log(`c${ch}: ${JSON.stringify(await localCall(code, ch, data))}`); }
-  catch (e: any) { console.log(`c${ch}: ERROR ${String(e.message).slice(0, 120)}`); process.exitCode = 1; }
+  // DO NOT re-truncate. This used to slice at 120 chars, which cut every error off
+  // mid-JSON — including the one this tool is most used for during a ceremony:
+  // dry-running a built transaction's code, where reaching
+  // "ops authorization failed: …" is the GREEN result and a `time` parse failure is
+  // the abort. Both live past character 120, so the operator could not tell them
+  // apart and had to write a throwaway script to read the message. env.ts already
+  // caps the underlying error at 300 chars, so nothing here is unbounded.
+  catch (e: any) { console.log(`c${ch}: ERROR ${String(e.message)}`); process.exitCode = 1; }
 }
