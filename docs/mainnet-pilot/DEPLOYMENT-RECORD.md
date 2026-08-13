@@ -200,17 +200,38 @@ own `@doc`; upgradeability is disclosed in the README.
 
 ---
 
-## 6. What is NOT done
+## 6. Status since deployment
+
+> **CORRECTED 2026-08-13.** This section described the state at the close of the deploy ceremony
+> and was never updated when the program started, so for twelve days it told readers that claiming
+> was closed, that no rounds existed and that the token was "deployed and inert" — while the
+> genesis round was live and being claimed. The figures below carry the date they were measured;
+> **the chain is the source of truth, not this file.** Re-read it rather than quoting these.
 
 ```
-open-claims        NOT RUN — claims are CLOSED, no rounds exist
-                   verified: (at 'open (pco-claim.get-config)) == false
-                             (pco-claim.round-ids) == []
+open-claims        RUN 2026-08-01 — claiming is OPEN, the genesis round is live
 freeze             NOT RUN — modules remain upgradeable by governance
 ```
 
-**No PCO has been distributed to anyone.** The entire supply sits in the pool and the reserve.
-The token is deployed and inert.
+Measured on chain 0 at **2026-08-13**:
+
+| Read | Value |
+|---|---|
+| `(at 'open (pco-claim.get-config))` | `true` |
+| `(pco-claim.round-ids)` | `["genesis"]` |
+| `(pco-claim.get-round "genesis")` | 100 per claim, budget 30,000, **claimed 3,700**, window `2026-08-01` → `2026-08-31` |
+| `(pco-claim.pool-balance)` | 894,375 |
+
+Recognition grants have also been paid from the pool. Every one exists on-chain as an `AWARDED`
+event carrying its public reason — **those events are the ledger**, and a total is deliberately not
+quoted here while an internal reconciliation of the grant figures is open.
+
+Anyone can re-derive all of the above:
+
+```
+(pco-claim.get-config)   (pco-claim.round-ids)   (pco-claim.get-round "genesis")
+(pco-claim.pool-balance)
+```
 
 ---
 

@@ -47,7 +47,7 @@ limit, not a solvency check — see §5).
 
 | Rhythm | Op | Tier |
 |---|---|---|
-| Biweekly (first 90 days, then monthly) | Pact Quest round: pick Q&A → hash → `create-round` → announce with round id | ops solo |
+| Biweekly (first 90 days, then monthly) | Pact Quest round: pick Q&A → hash → **`ops/preflight-round.sh` (the gate)** → `create-round` → read back → announce with round id | ops solo |
 | Monthly | Governance round: draft proposal (embed reading-code) → open from the bootstrap account → `create-round gov-YYYY-MM` (window = voting window) → announce | ops solo (proposal via bootstrap account) |
 | Monthly | Awards batch: collect board merges + micro-recognitions → consolidate per receiver → ONE `grant-batch` | ops solo |
 | Per event | Community call: schedule → `create-round call-YYYY-MM-DD` (48h window) → speak the code live | ops solo |
@@ -60,7 +60,22 @@ All from `ops/` with the network env set deliberately (`PCO_NETWORK=mainnet01
 PCO_HOST=https://api.chainweb-community.org` for mainnet; defaults target the local devnet).
 Files are emitted to `out/<networkId>/`; the submit tool refuses cross-network files.
 
-**Create a round** (example: quest round, 100 × 2,500, two weeks):
+**Create a round.** `ops/preflight-round.sh` is the gate, and it runs before anything is built —
+22 checks: the ceremony tooling matches its reviewed pin, the round id is still free on-chain, the
+answer matches its hash, **the answer is not already public**, both time literals parse against the
+deployed engine, the window is ordered and leads block time, the award respects the contract's
+bounds, the daily ops meter and the pool cover it, claiming is open, and the station can sponsor.
+Exit 0 is GO; any failing check means the round is not opened. It is necessary and never
+sufficient — it cannot judge the question, choose the window, or compare the hash on the device
+screen against a second machine.
+
+```
+cd ops && PCO_NETWORK=mainnet01 PCO_HOST=https://api.chainweb-community.org \
+PCO_ROUND_ID=<id> PCO_QUEST_ANSWER='<normalized answer>' \
+PCO_OPENS=<UTC> PCO_CLOSES=<UTC> ./preflight-round.sh
+```
+
+The underlying commands (example: quest round, 100 × 2,500, two weeks):
 ```
 pact> (hash "the-normalized-answer")            # off-chain, never in tx code
 PCO_ROUND_ID=quest-3 PCO_CODE_HASH=<hash> \

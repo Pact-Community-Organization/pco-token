@@ -364,22 +364,40 @@ console.log('ceremony tooling checks\n');
     try {
       const out = execFileSync('npx', ['tsx', 'src/build-tx.ts', 'upgrade', '0'], {
         cwd: new URL('..', import.meta.url).pathname, stdio: 'pipe',
-        env: { ...process.env, PCO_MODULE: mod },
+        // PIN THE NETWORK rather than inheriting it. This used to pass `...process.env`
+        // alone, so the emitted files landed in out/<whatever PCO_NETWORK happened to be>.
+        // Two consequences, both observed: an operator with PCO_NETWORK=mainnet01 exported
+        // (i.e. mid-ceremony) had this suite write real module-UPGRADE transactions, carrying
+        // the real device keys and namespace, into the ceremony directory; and with the var
+        // unset they went to out/recap-development/, which snapshotOut/cleanupOut do not
+        // watch, so they were never removed. Pinning it here makes the emitted path match
+        // the directory the cleanup below actually cleans.
+        env: {
+          ...process.env, PCO_MODULE: mod,
+          PCO_NETWORK: 'mainnet01', PCO_HOST: 'https://api.chainweb-community.org',
+        },
       });
       return { aborted: false, out: String(out) };
     } catch (e: any) {
       return { aborted: true, out: String(e.stdout ?? '') + String(e.stderr ?? '') };
     }
   };
-  const claim = upgrade('pco-claim');
-  check('the freeze order step 4 (redeploy pco-claim) can actually be BUILT',
-    !claim.aborted, claim.out.slice(0, 100));
-  const token = upgrade('pco');
-  check('an unblessed `pco` upgrade is still REFUSED (it owns the defpact and both dependents pin it)',
-    token.aborted && /carries no \(bless/.test(token.out), token.out.slice(0, 100));
-  // restore the EXACT prior state: the developer's config, or no file at all
-  if (had) writeFileSync(cfgPath, prior as string);
-  else rmSync(cfgPath, { force: true });
+  try {
+    const claim = upgrade('pco-claim');
+    check('the freeze order step 4 (redeploy pco-claim) can actually be BUILT',
+      !claim.aborted, claim.out.slice(0, 100));
+    const token = upgrade('pco');
+    check('an unblessed `pco` upgrade is still REFUSED (it owns the defpact and both dependents pin it)',
+      token.aborted && /carries no \(bless/.test(token.out), token.out.slice(0, 100));
+  } finally {
+    // restore the EXACT prior state: the developer's config, or no file at all
+    if (had) writeFileSync(cfgPath, prior as string);
+    else rmSync(cfgPath, { force: true });
+    // and remove every ceremony file this block caused build-tx to emit. In a `finally`
+    // because a FAILING check must not leave a signable upgrade transaction on disk —
+    // that is exactly when the operator is distracted.
+    cleanupOut(outBefore);
+  }
 }
 
 // ------------------------------- the gas-payer secret can never be committed

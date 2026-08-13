@@ -41,7 +41,7 @@ The answer is findable in three independent places, and finding it is the round:
 the token repository, that repository's README, and the deployed modules on chain. Any one of them
 is enough.
 
-## Round 2 — `quest-2` (week 2)
+## Round 2 — `quest-2`
 
 | Field | Value |
 |---|---|
@@ -50,6 +50,9 @@ is enough.
 | Answer / code | *not published* |
 | Amount / budget | 100 PCO / 2,500 PCO |
 | Window | 14 days |
+
+Answerable two independent ways — from this repository's contracts, and from the deployed modules
+on chain. Either one is enough, and looking is the round.
 
 ## Governance reading-quests — `gov-YYYY-MM` (monthly)
 
@@ -79,8 +82,20 @@ Code spoken live during the call, never posted in text. Amount 50 PCO, budget 1,
 
 ## Round checklist (operator)
 
-1. Pick id + question + answer; normalize the answer (lowercase, trim).
-2. Compute the hash off-chain; never put the plaintext code in tx code.
-3. `build-tx.ts create-round` (ops key signs alone), submit, verify `get-round`.
-4. Announce on all four channels **with the round id**.
-5. At close (+ a day), post honest participation numbers (distinct accounts).
+Every round goes through a scripted preflight before anything is built or signed. It checks, among
+other things, that the ceremony tooling matches its reviewed pin, that the round id is still free,
+that the answer matches its published hash, that the window's time literals parse against the
+deployed engine, that the award fits the contract's bounds and the pool, and — because a
+pre-published answer would hand the round's whole budget to whoever read it — **that the answer is
+not already public**. Any failing check stops the round.
+
+1. Pick id + question + answer; normalize the answer (lowercase, trim). The claim page lowercases
+   and trims what the claimant types, so an answer carrying capitals would be unclaimable — the
+   hash is always computed over the normalized form.
+2. Run the preflight. It is a gate, not a report: a red check means the round is not opened.
+3. Compute the hash off-chain; never put the plaintext code in tx code.
+4. `build-tx.ts create-round` (ops key signs alone). The transaction hash is compared on a second
+   machine against the device screen before it is approved.
+5. Submit, then verify `get-round` on-chain **before** announcing.
+6. Announce on all four channels **with the round id**.
+7. At close (+ a day), post honest participation numbers (distinct accounts).

@@ -119,9 +119,17 @@ function emit(name: string, tx: any) {
   // parameters to literal "TO-FILL-…" strings when the operator forgets an env
   // var. Pact 5.4 ACCEPTS those happily — a rotate would permanently define a
   // keyset over a key nobody holds, and a create-round would set a code hash
-  // nobody can answer. Neither is recoverable. Catch it here, once, for every
-  // step, rather than trusting the operator to notice it on the device screen
-  // (which shows only a hash).
+  // nobody can answer. Catch it here, once, for every step, rather than trusting
+  // the operator to notice it on the device screen (which shows only a hash).
+  //
+  // CORRECTION (2026-08-13): this comment used to say "neither is recoverable",
+  // and for the code hash that is FALSE — `set-round-code` rotates it, and the
+  // `create-round-code` step below builds exactly that transaction. The condition
+  // is `claimed == 0.0`, so the remedy expires at the FIRST CLAIM, not at mining.
+  // The genuinely unrecoverable create-round fields are the ones with no setter
+  // at all: the round id (burned by `insert`), `opens`, `closes`, `amount` and
+  // `budget`. Spend the pre-signature double-check there, not on the hash.
+  // Getting this backwards wastes scrutiny on the one field that has a remedy.
   if (JSON.stringify(tx).includes('TO-FILL')) {
     const hits = [...JSON.stringify(tx).matchAll(/TO-FILL[A-Za-z0-9-]*/g)].map((m) => m[0]);
     throw new Error(
@@ -165,7 +173,24 @@ const A_SOLO: string[] = [cfg.deviceA];
 // is submittable by anyone holding the file, so the window is also an exposure
 // window. 8h covers any realistic session with 4x margin without leaving signed
 // ceremony transactions valid for two days.
-const CEREMONY_TTL = Number(process.env.PCO_TTL ?? 28800);
+// VALIDATED, because this is an override that silently ruins a signed transaction.
+// `Number()` alone turns a typo into NaN, which serialises as `null` and is rejected
+// only at submit — after the approvals are spent. Too small expires mid-ceremony
+// (the failure above); too large is refused by chainweb outright (measured 2026-07-31
+// on mainnet01: 172800 validates, 259200 is rejected) and needlessly widens the window
+// in which a signed file is submittable by anyone holding it.
+const CEREMONY_TTL = (() => {
+  const raw = process.env.PCO_TTL;
+  if (raw === undefined) return 28800;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 600 || n > 172800) {
+    console.error(
+      `ABORT: PCO_TTL must be a whole number of seconds between 600 and 172800 ` +
+      `(chainweb's measured ceiling is 48h); got ${JSON.stringify(raw)}`);
+    process.exit(1);
+  }
+  return n;
+})();
 const only = process.argv[3];
 const chains = only ? [only] : CHAINS;
 

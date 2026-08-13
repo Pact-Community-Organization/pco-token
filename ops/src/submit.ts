@@ -40,23 +40,46 @@ function die(msg: string): never { console.error(`ABORT: ${msg}`); process.exit(
 
 // ---------- args ----------
 const args = process.argv.slice(2);
-const file = args.find((a) => !a.startsWith('--'));
-if (!file) die('usage: submit.ts <emitted.json> --sig pub=sighex ... [--sign-with secrethex] [--send]');
+const USAGE = 'usage: submit.ts <emitted.json> --sig pub=sighex ... [--sign-with secrethex] [--send]';
+
+// FLAG VALUES ARE CONSUMED BEFORE THE FILE IS CHOSEN, and that ordering is the whole point.
+// This used to pick the path with `args.find(a => !a.startsWith('--'))` evaluated BEFORE the
+// loop below, so a flag's VALUE was eligible to be the path: `--sign-with <secret> <file>`
+// selected the 64-hex SECRET, handed it to readFileSync, and Node printed it verbatim in an
+// uncaught ENOENT trace. The gas softkey is already exposed to shell history and `ps` — it must
+// not also land in the terminal scrollback, where it is far more likely to be pasted or shared.
+// Single pass: flags consume their own arguments, everything left over is positional.
 const sigArgs = new Map<string, string>();   // pubkey -> signature hex
 const signWith: string[] = [];
+const positional: string[] = [];
+let doSend = false;
 for (let i = 0; i < args.length; i++) {
-  if (args[i] === '--sig') {
+  const a = args[i];
+  if (a === '--sig') {
     const [pub, sig] = (args[++i] ?? '').split('=');
     if (!/^[0-9a-f]{64}$/.test(pub ?? '') || !/^[0-9a-f]{128}$/.test(sig ?? ''))
       die(`--sig wants <64-hex-pubkey>=<128-hex-signature>, got: ${pub}=${(sig ?? '').slice(0, 16)}…`);
     sigArgs.set(pub, sig);
-  } else if (args[i] === '--sign-with') {
+  } else if (a === '--sign-with') {
     const sec = args[++i] ?? '';
     if (!/^[0-9a-f]{64}$/.test(sec)) die('--sign-with wants a 64-hex ed25519 secret (softkey only)');
     signWith.push(sec);
+  } else if (a === '--send') {
+    doSend = true;
+  } else if (a.startsWith('--')) {
+    die(`unknown flag: ${a}\n${USAGE}`);
+  } else {
+    positional.push(a);
   }
 }
-const doSend = args.includes('--send');
+const file = positional[0];
+if (!file) die(USAGE);
+if (positional.length > 1)
+  die(`expected ONE file path, got ${positional.length}: ${positional.join(' ')}`);
+// Belt and braces: a bare 64-hex positional is a secret that missed its flag, never a filename.
+// Refuse it by SHAPE before it can reach readFileSync and be echoed in an error.
+if (/^[0-9a-f]{64}$/.test(file))
+  die('refusing: that file path is 64 hex characters — it looks like a secret, not a path. Put the FILE PATH first.');
 
 // ---------- load + integrity ----------
 const tx: Emitted = JSON.parse(readFileSync(file, 'utf8'));
