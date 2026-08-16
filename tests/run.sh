@@ -25,7 +25,7 @@ fi
 if ! ../ops/make-dryrun.sh >/dev/null; then
   echo "FAIL  ops/make-dryrun.sh (could not regenerate the dry-run contracts)"; exit 1
 fi
-for f in pco.repl pco-claim.repl pco-gas-station.repl namespace-rehearsal.repl lifecycle.repl negatives.repl regressions.repl ops-recovery.repl pairwise.repl dryrun-smoke.repl xchain.repl frozen.repl missing-tables.repl freeze-inflight.repl freeze-interlock.repl; do
+for f in pco.repl pco-claim.repl pco-gas-station.repl namespace-rehearsal.repl lifecycle.repl negatives.repl regressions.repl ops-recovery.repl pairwise.repl dryrun-smoke.repl xchain.repl frozen.repl missing-tables.repl freeze-inflight.repl freeze-interlock.repl vision-offhub-voting.repl vision-shared-deadline.repl; do
   if pact "$f" >/dev/null 2>&1; then echo "PASS  $f"; else echo "FAIL  $f"; fail=1; fi
 done
 # The ceremony tooling asserts itself too. A mutation audit found that every
@@ -37,6 +37,10 @@ if (cd ../ops && npm run --silent test-ops >/dev/null 2>&1); then
 else
   echo "FAIL  ops/test/ops-checks.ts (ceremony tooling)"; fail=1
 fi
+# The off-chain vote combiner and its self-test (combine-checks.ts) are part of the
+# private suite; the public mirror runs a smaller set (see the note in run.sh's
+# header comment). The combiner and its checks are not published, so they are not
+# gated here.
 # The only gate that compares TWO artifacts. Everything above reads one
 # artifact and asks whether it agrees with itself: static-check reads .pact,
 # the suites load .repl, verify-hash byte-compares the deploy against the same
@@ -53,12 +57,23 @@ if ../.github/scripts/runbook-hashes.sh >/dev/null 2>&1; then
 else
   echo "FAIL  runbook-hashes (§A does not match the contract bytes - run it directly)"; fail=1
 fi
-# ui-contract-check compares a UI's contract calls against the contracts. The
-# canonical PCO interface lives in its own repository
-# (Pact-Community-Organization/website), so there is no UI in THIS repository to
-# check — and the checker reports PASS on zero files, which would be a green that
-# means nothing. Skipped explicitly instead, so nobody mistakes it for a result.
-echo "SKIP  ui-contract-check (the UI lives in the website repository)"
+# The CANONICAL UI is in a DIFFERENT repository (the website), so this repo's CI
+# can never see it. Scan it when its checkout happens to sit beside this one, and
+# print which trees were covered either way - the point is that the limit is
+# stated on every run instead of being invisible. web/ alone always yields calls,
+# so the "examined nothing" floor cannot trip merely because the website is absent.
+ui_roots=(../web)
+ui_what="web/"
+site=${PCO_SITE_SRC:-../../pco-website/src}
+if [ -d "$site" ]; then ui_roots+=("$site"); ui_what="web/ + the canonical website UI"; fi
+if ui_out=$(python3 ../.github/scripts/ui-contract-check.py --contracts ../contracts "${ui_roots[@]}" 2>&1); then
+  # Print the coverage line: it names how many calls were actually checked, which
+  # is the whole point of the gate and used to be discarded to /dev/null.
+  echo "PASS  ui-contract-check ($ui_what)"
+  echo "$ui_out" | sed -n 's/^-- ui-contract-check: /      /p'
+else
+  echo "FAIL  ui-contract-check ($ui_what):"; echo "$ui_out" | sed 's/^/      /'; fail=1
+fi
 # A negative test that does not name its expected error passes on ANY error. A
 # cold audit found 16 here and proved two hollow by typo-ing a data key - the
 # call then failed for an unrelated reason and the suite stayed green.

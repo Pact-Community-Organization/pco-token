@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PCO Community Token — claim</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 680px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 2rem; }
+  .card { border: 1px solid #8884; border-radius: 10px; padding: 1rem 1.2rem; margin: 1rem 0; }
+  .muted { opacity: .7; font-size: .9rem; }
+  code, .mono { font-family: ui-monospace, monospace; font-size: .85rem; word-break: break-all; }
+  input { padding: .5rem; border-radius: 6px; border: 1px solid #8886; width: 14rem; }
+  button { padding: .5rem .9rem; border-radius: 6px; border: 1px solid #8886; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  #status { padding: .6rem .8rem; border-radius: 8px; margin: 1rem 0; min-height: 1.4em; }
+  #status[data-kind="ok"] { background: #1a7f3722; }
+  #status[data-kind="err"] { background: #c92a2a22; }
+  .banner { background: #fab00522; border: 1px solid #fab00555; border-radius: 8px; padding: .6rem .9rem; font-size: .9rem; }
+</style>
+</head>
+<body>
+  <h1>PCO Community Token</h1>
+  <p class="banner"><b>Free & valueless by design.</b> PCO is a community
+  experiment: an advisory governance token for
+  <a href="https://pact-community.org">Pact Community Organization</a> tooling
+  direction. It carries <b>no dividends, no revenue rights, no monetary
+  value</b>, and is never sold. Votes are advisory signals — they execute
+  nothing.</p>
+
+  <h2>1 · Claim — no wallet, no fee</h2>
+  <div class="card">
+    <p class="muted">A key is generated in this browser and the PCO gas station
+    pays the fee, so claiming needs <b>no wallet and no KDA</b>. This is the only
+    action the station sponsors.</p>
+    <p class="mono" id="account">…</p>
+    <p class="muted"><b>This key lives only in this browser.</b> Clearing your
+    browser storage deletes it, and anyone with it controls the account — so
+    download and keep the backup.
+    <button id="backup-btn">download key backup</button>
+    <button id="restore-btn">restore from backup</button></p>
+    <input id="restore-file" type="file" accept="application/json" style="display:none">
+    <p>This browser key holds: <b id="balance">…</b></p>
+    <hr style="border:none;border-top:1px solid #8883;margin:1rem 0">
+    <h3 style="margin:0 0 .5rem">Claim — <span id="claim-state">…</span></h3>
+    <p class="muted" id="pool">…</p>
+    <p>Pick a round and answer its <b>community quest</b> (each round's
+    question is published on the PCO channels with its round id):</p>
+    <p><select id="round"></select></p>
+    <p><input id="code" placeholder="engagement code"> <button id="claim-btn">claim</button></p>
+    <p class="muted">Official rounds exist on-chain — verify any announcement's
+    round id against this page. We never direct-message claim links.</p>
+  </div>
+
+  <h2>2 · Send PCO — connect a wallet</h2>
+  <div class="card">
+    <p class="muted">Transfers are <b>not gas-sponsored</b> (only claiming is).
+    To send, connect a Kadena wallet
+    (<a href="https://wallet.ecko.finance">eckoWallet</a>) that holds a little KDA
+    for gas — the wallet signs and pays.</p>
+    <p>Wallet: <b class="mono" id="wallet-account">not connected</b>
+       <button id="connect-btn">connect wallet</button>
+       <button id="disconnect-btn" style="display:none">disconnect</button></p>
+    <p class="muted">Wallet holds: <b id="wallet-balance">—</b></p>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-top:0">Send PCO</h2>
+    <p class="muted">Send to a <span class="mono">k:</span> account — double-check
+    it, transfers are irreversible. Same-chain, or cross-chain to another chain.</p>
+    <p><input id="to" placeholder="k:recipient account" style="width:100%"></p>
+    <p><input id="amount" placeholder="amount">
+       <button id="transfer-btn" disabled>send (this chain)</button></p>
+    <p><label class="muted">cross-chain to chain
+       <input id="x-chain" placeholder="0–19" style="width:5rem"></label>
+       <button id="xtransfer-btn" disabled>send cross-chain</button></p>
+  </div>
+
+  <h2>Advisory governance</h2>
+  <div class="card">
+    <p class="muted">Governance questions are <b>ranked-choice</b>: each question
+    carries 2–5 named options and a ballot is your <b>ranking</b> of them, scored
+    with Borda counts plus a head-to-head matrix. Questions are authored by the
+    organisation from suggestions raised on the public channels — holding PCO
+    does not open one, and there is no balance threshold of any kind.</p>
+    <p>Read the open questions and cast a ranked ballot on the PCO site:
+    <a href="https://pact-community.org/token">pact-community.org/token</a>.</p>
+    <p class="muted">Votes are advisory signals — they execute nothing.</p>
+  </div>
+
+  <div id="status"></div>
+  <p class="muted">network: <span id="net" class="mono"></span> ·
+  <a href="https://github.com/Pact-Community-Organization">source</a></p>
+  <script src="./app.js"></script>
+</body>
+</html>

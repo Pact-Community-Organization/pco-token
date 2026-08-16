@@ -12,6 +12,7 @@
 //     PCO_NS=n_<hash> npx tsx src/verify-deployed.ts --all-chains
 import { readFileSync } from 'node:fs';
 import { CHAINS, HUB, NS, localCall } from './env.js';
+import { NEEDS_BLESS } from './freeze-source.js';
 
 const MODULES = ['pco', 'pco-claim', 'pco-gas-station'] as const;
 const contractFile = (m: string) =>
@@ -50,6 +51,7 @@ async function main() {
     const qualified = `${NS}.${m}`;
     const localForm = localModuleForm(contractFile(m)).trim();
     const hashes = new Map<string, string[]>();  // hash -> chains
+    const stale = new Map<string, string[]>();   // hash -> chains whose code differs from the repo
 
     for (const ch of chains) {
       let deployed: string, hash: string;
@@ -62,6 +64,11 @@ async function main() {
       }
       (hashes.get(hash) ?? hashes.set(hash, []).get(hash)!).push(ch);
       if (deployed !== localForm) {
+        // This chain runs OTHER code than the repo, so the repo represents a pending
+        // upgrade and `hash` is a predecessor the new source has to bless. Where the
+        // code MATCHES, `hash` is this very source's hash — a module does not bless
+        // itself, and demanding it would fail every check right after a clean deploy.
+        (stale.get(hash) ?? stale.set(hash, []).get(hash)!).push(ch);
         console.log(`  ✗ ${qualified} @${ch}: DEPLOYED CODE DIFFERS from the repo`);
         // point at the first divergence to make triage quick
         const n = Math.min(deployed.length, localForm.length);
@@ -74,11 +81,41 @@ async function main() {
 
     if (hashes.size === 1) {
       const [[hash, chs]] = [...hashes];
-      console.log(`  ✓ ${qualified}: code matches the repo; uniform hash ${hash} across ${chs.length} chain(s)`);
+      // Hash uniformity and code-match are DIFFERENT facts, and this line used to
+      // assert both from evidence for only one: it printed "code matches the repo"
+      // whenever the hash was uniform, so a repo ahead of the chain produced a ✗
+      // mismatch line immediately followed by a ✓ claiming a match. Mid-ceremony
+      // that reads as all-clear.
+      const matches = stale.size === 0;
+      console.log(`  ${matches ? '✓' : '✗'} ${qualified}: ` +
+        `${matches ? 'code matches the repo' : 'code DIFFERS from the repo (above)'}; ` +
+        `uniform hash ${hash} across ${chs.length} chain(s)`);
     } else if (hashes.size > 1) {
       console.log(`  ✗ ${qualified}: NON-UNIFORM hashes across chains (a partial/forked deploy):`);
       for (const [h, chs] of hashes) console.log(`      ${h} on chains ${chs.join(',')}`);
       ok = false;
+    }
+
+    // the chain-local voting design C1: before `pco` can be upgraded, the new source must bless the
+    // hash that is ACTUALLY DEPLOYED. build-tx's gate only checks that SOME bless
+    // form exists, which a stale one satisfies — and a stale bless is worse than
+    // none, because it looks like the hazard was handled. Only the chain can settle
+    // which hash that is, so it is checked here and not in a unit test.
+    if (NEEDS_BLESS.has(m) && stale.size > 0) {
+      const blessed = [...localModuleForm(contractFile(m)).matchAll(/\(bless\s+"([^"]*)"\s*\)/g)]
+        .map((x) => x[1]);
+      const unblessed = [...stale.entries()].filter(([h]) => !blessed.includes(h));
+      if (unblessed.length === 0) {
+        console.log(`  ✓ ${qualified}: the pending upgrade blesses every hash it replaces ` +
+                    `(${[...stale.keys()].join(', ')}) — no pin breaks between the two deploys`);
+      } else {
+        console.log(`  ✗ ${qualified}: the repo source does NOT bless the deployed hash. An upgrade`);
+        console.log(`      built from it strands in-flight cross-chain transfers and breaks every`);
+        console.log(`      dependent pin. Add these to the module header before building:`);
+        for (const [h, chs] of unblessed) console.log(`        (bless "${h}")   ; live on chain(s) ${chs.join(',')}`);
+        if (blessed.length) console.log(`      (source currently blesses: ${blessed.join(', ')})`);
+        ok = false;
+      }
     }
   }
 

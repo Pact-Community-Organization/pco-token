@@ -55,8 +55,9 @@
 (free.pco-claim.create-round "frozen-round" (hash "frozen-code") 100.0 1000.0
   (time "2026-07-01T00:00:00Z") (time "2026-12-31T00:00:00Z"))
 (free.pco-claim.set-open true)
-(free.pco.create-proposal "frz" "does a frozen system still work?" ["a" "b"] 720)
+(free.pco.create-proposal "1" "frz" "does a frozen system still work?" ["a" "b"] (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-31T12:00:00Z"))
 (commit-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })  ; past the 12h announce window (the chain-local voting design C8)
 
 (begin-tx "U-6: the pool pays out while the pair is live")
 ;; Runs BEFORE any freeze. It has to: a funded pco-claim can no longer be frozen

@@ -11,11 +11,26 @@
 // Re-run-safe: fresh claimant keys per run; funds a proposer from the reserve
 // only if needed; asserts DELTAS, not absolutes.
 import {
-  CHAINS, HUB, NS, SENDER00, checks, localCall, newKey, preflight, record, send,
+  CHAINS, HUB, NS, SENDER00, checks, localCall, newKey, preflight, record, skip, send,
   type Keypair, type SignerSpec,
 } from './env.js';
 
 const T = `${NS}.pco`;
+
+// the chain-local voting design: create-proposal takes an explicit id and three absolute instants,
+// anchored to CHAIN time. Every call below goes through this, INCLUDING the ones
+// that are supposed to be REFUSED: a 4-argument call now fails on arity, so a
+// negative asserting "governance or ops authority required" would pass for the
+// wrong reason and stop testing authority entirely.
+const isoZ = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+const chainNow = async () => new Date(String(await localCall("(at 'block-time (chain-data))", HUB)));
+function proposalCall(pid: string, title: string, body: string, options: string[], now: Date) {
+  const starts = new Date(now.getTime() + 12.5 * 3600_000);   // just past the 12h floor
+  const ends = new Date(starts.getTime() + 168 * 3600_000);   // a week, inside 24h..30d
+  return `(${T}.create-proposal "${pid}" "${title}" "${body}" `
+       + `[${options.map((o) => `"${o}"`).join(' ')}] `
+       + `(time "${isoZ(now)}") (time "${isoZ(starts)}") (time "${isoZ(ends)}"))`;
+}
 const C = `${NS}.pco-claim`;
 const G = `${NS}.pco-gas-station`;
 const KS = `${NS}.pco-gov`;
@@ -157,7 +172,7 @@ async function main() {
     ['transfer', `(${T}.transfer "${ghost.account}" "${friend.account}" 1.0)`,
       (wc: any) => [wc(`${T}.TRANSFER`, ghost.account, friend.account, { decimal: '1.0' })]],
     ['cast-vote', `(${T}.cast-vote "1" "${ghost.account}" [0])`, (wc: any) => [wc(`${T}.VOTE`, '1', ghost.account)]],
-    ['create-proposal', `(${T}.create-proposal "t" "b" ["a" "b"] 72)`, () => []],
+    ['create-proposal', proposalCall('station-probe', 't', 'b', ['a', 'b'], await chainNow()), () => []],
   ] as const) {
     const r = await preflight(sponsored(ghost, code, caps as any, {}, `station-${name}`));
     record('station', `station does not carry ${name} through (tx refused)`, !r.ok, r.error.slice(0, 60));
@@ -186,102 +201,139 @@ async function main() {
   // ---------- 5. proposing is ADMIN-AUTHORED (community goes via the channels) ----------
   await fundKda(me.account, me.publicKey);
   const communityProp = await preflight(selfPaid(me,
-    `(${T}.create-proposal "t" "b" ["a" "b"] 72)`,
+    proposalCall('holder-probe', 't', 'b', ['a', 'b'], await chainNow()),
     () => [], {}, 'holder propose'));
   record('propose', 'a token holder CANNOT create proposals (admin-authored governance)',
     !communityProp.ok && communityProp.error.includes('governance or ops authority required'),
     communityProp.error.slice(0, 70));
 
-  // the OPS key opens the ranked-choice question the community will vote on
-  let pid: string;
+  // the OPS key opens a ranked-choice question
+  const nowT = await chainNow();
+  const newPid = `e2e-${await localCall("(at 'block-height (chain-data))", HUB)}`;
   try {
     const prop = await send({
       label: 'OPS opens a ranked-choice question', chainId: HUB,
-      code: `(${T}.create-proposal "E2E: which docs matter most?" "Advisory e2e signal - rank the options." ["guides" "reference" "examples"] 168)`,
+      code: proposalCall(newPid, 'E2E: which docs matter most?',
+        'Advisory e2e signal - rank the options.', ['guides', 'reference', 'examples'], nowT),
       signers: [gasCap(SENDER00), { kp: K.deviceA }],
-      gasLimit: 4000,
+      gasLimit: 8000,
     });
-    pid = (prop.result as any).data;
-    record('propose', 'the OPS key alone opened a ranked-choice question', typeof pid === 'string', `pid ${pid}`);
+    record('propose', 'the OPS key alone opened a ranked-choice question',
+      (prop.result as any).data === newPid, `pid ${newPid}, opens in 12.5h`);
   } catch (e: any) {
     if (!String(e.message).includes('too many active proposals')) throw e;
-    const open: string[] = await localCall(`(${T}.open-ids)`, HUB);
-    pid = open[open.length - 1];
-    record('propose', 'open-proposal cap (3) held — reusing an open question for the vote leg', open.length === 3, `pid ${pid}`);
+    record('propose', 'open-proposal cap (3) held — a fourth question is refused', true);
   }
 
-  // ---------- 6. ranked ballots (SELF-PAID) + re-vote ----------
-  await fundKda(friend.account, friend.publicKey);   // the voter pays their own gas
-  const r0 = await localCall(`(${T}.get-results "${pid}")`, HUB);
-  const K3 = (r0.options as string[]).length;
-  await send(selfPaid(friend,
-    `(${T}.cast-vote "${pid}" "${friend.account}" [0])`,
-    (wc) => [wc(`${T}.VOTE`, pid, friend.account)], {}, 'self-paid ranked ballot'));
-  const rv = await localCall(`(${T}.get-results "${pid}")`, HUB);
-  record('vote', 'member ranked [0] paying their own gas (+K*w points on option 0)',
-    rv.scores[0] === r0.scores[0] + K3 * sendAmt && rv.turnout === r0.turnout + sendAmt);
-  // re-vote REPLACES the ballot in place: [1 0] moves the top preference
-  await send(selfPaid(friend,
-    `(${T}.cast-vote "${pid}" "${friend.account}" [1 0])`,
-    (wc) => [wc(`${T}.VOTE`, pid, friend.account)], {}, 're-rank'));
-  const rv2 = await localCall(`(${T}.get-results "${pid}")`, HUB);
-  record('vote', 're-rank replaced the ballot ([0] -> [1,0]) with no double count',
-    rv2.scores[0] === r0.scores[0] + (K3 - 1) * sendAmt
-    && rv2.scores[1] === r0.scores[1] + K3 * sendAmt
-    && rv2.turnout === r0.turnout + sendAmt);
-  // a signer that doesn't match the voting account is refused (the VOTE cap
-  // guards the account; a different key can't vote as someone else)
-  const stranger = newKey();
-  await fundKda(stranger.account, stranger.publicKey);
-  const mismatch = await preflight(selfPaid(stranger,
-    `(${T}.cast-vote "${pid}" "${friend.account}" [0])`,
-    (wc) => [wc(`${T}.VOTE`, pid, friend.account)], {}, 'vote sig mismatch'));
-  record('vote', 'a signature not matching the voting account is refused', !mismatch.ok, mismatch.error.slice(0, 70));
+  // THE QUESTION JUST CREATED CANNOT BE VOTED ON. the chain-local voting design C8 requires
+  // starts-at to be at least 12h after created-at, so the earliest legal opening
+  // is ~11h from now and no single run can create a question and vote in it.
+  // The vote leg therefore uses a question that is votable RIGHT NOW — one left
+  // by an earlier run on this devnet — and is SKIPPED, not faked, when the
+  // devnet is freshly genesised. A skipped check is never counted as a pass.
+  const open: string[] = await localCall(`(${T}.open-ids)`, HUB);
+  const pid: string | null = open.length ? open[0] : null;
 
-  // ---------- 7. vote KEY: hot key votes, cold key stays cold ----------
-  const hot = newKey();
-  await send(selfPaid(friend,
-    `(${T}.set-vote-key "${friend.account}" (read-keyset 'vk))`,
-    (wc) => [wc(`${T}.VOTE-KEY-ADMIN`, friend.account, `k:${hot.publicKey}`)],
-    { vk: { keys: [hot.publicKey], pred: 'keys-all' } }, 'register vote key'));
-  record('votekey', 'member registered a vote key under their MAIN guard',
-    Boolean(await localCall(`(at 'active (${T}.get-vote-key "${friend.account}"))`, HUB)));
-  await fundKda(hot.account, hot.publicKey);   // hot key pays its own vote gas
-  await send(selfPaid(hot,
-    `(${T}.cast-vote "${pid}" "${friend.account}" [2])`,
-    (wc) => [wc(`${T}.VOTE`, pid, friend.account)], {}, 'hot-key vote'));
-  const hkv = await localCall(`(${T}.get-ballot "${pid}" "${friend.account}")`, HUB);
-  const hkr = (hkv.ranking as any[]).map((v) => (typeof v === 'object' ? v.int : v));
-  record('votekey', 'HOT key ranked for the cold account (ballot recorded)', JSON.stringify(hkr) === JSON.stringify([2]), JSON.stringify(hkv).slice(0, 60));
-  // The receiver must ALREADY hold PCO. `transfer` reads the receiver row
-  // first, so sending to an account with no row aborts at that read - before
-  // the sender's guard is ever checked - and this negative would then pass for
-  // the wrong reason, proving nothing about the hot key.
-  const hotSteal = await preflight(selfPaid(hot,
-    `(${T}.transfer "${friend.account}" "${me.account}" 1.0)`,
-    (wc) => [wc(`${T}.TRANSFER`, friend.account, me.account, { decimal: '1.0' })], {}, 'hot-key transfer'));
-  record('votekey', 'hot key CANNOT transfer the cold account\'s tokens',
-    !hotSteal.ok && hotSteal.error.includes('Keyset failure'), hotSteal.error.slice(0, 60));
-  const hotRepoint = await preflight(selfPaid(hot,
-    `(${T}.set-vote-key "${friend.account}" (read-keyset 'vk2))`,
-    (wc) => [wc(`${T}.VOTE-KEY-ADMIN`, friend.account, `k:${hot.publicKey}`)],
-    { vk2: { keys: [hot.publicKey], pred: 'keys-all' } }, 'hot-key repoint'));
-  record('votekey', 'hot key CANNOT re-point the registration',
-    !hotRepoint.ok && hotRepoint.error.includes('Keyset failure'), hotRepoint.error.slice(0, 60));
-  await send(selfPaid(friend,
-    `(${T}.clear-vote-key "${friend.account}")`,
-    (wc) => [wc(`${T}.VOTE-KEY-ADMIN`, friend.account, '')], {}, 'clear vote key'));
-  const hotCleared = await preflight(selfPaid(hot,
-    `(${T}.cast-vote "${pid}" "${friend.account}" [0])`,
-    (wc) => [wc(`${T}.VOTE`, pid, friend.account)], {}, 'cleared hot vote'));
-  record('votekey', 'a cleared vote key can no longer vote',
-    !hotCleared.ok && hotCleared.error.includes('neither account guard nor registered vote key'),
-    hotCleared.error.slice(0, 60));
+  // Sections 6 and 7 both need a question that is ALREADY OPEN for voting.
+  if (pid === null) {
+    // ONE SKIP LINE FOR EIGHT CHECKS IS AN UNDER-REPORT. The whole point of the
+    // skip state is that nothing vanishes quietly, and collapsing a guarded block
+    // into a single line shrank the headline from 24 to 17 while showing "1
+    // SKIPPED". Every check the guard hides is now named individually, so the
+    // ledger adds up and the size of the gap is visible.
+    const WHY = 'no question is open for voting on this devnet yet. The 12h announce floor puts the '
+      + 'earliest legal opening ~11h after authoring, so a single run cannot create one and vote in '
+      + 'it. The question opened above becomes votable in 12.5h — re-run then. Balloting is covered '
+      + 'meanwhile by tests/pco.repl and regressions.repl, where the clock is controlled.';
+    for (const [phase, name] of [
+      ['vote', 'member ranked [0] paying their own gas (+K*w points on option 0)'],
+      ['vote', 're-rank replaced the ballot ([0] -> [1,0]) with no double count'],
+      ['vote', 'a signature not matching the voting account is refused'],
+      ['votekey', 'member registered a vote key under their MAIN guard'],
+      ['votekey', 'HOT key ranked for the cold account (ballot recorded)'],
+      ['votekey', 'hot key CANNOT transfer the cold account'],
+      ['votekey', 'hot key CANNOT re-point the registration'],
+      ['votekey', 'a cleared vote key can no longer vote'],
+    ] as const) skip(phase, name, WHY);
+  } else {
+    // ---------- 6. ranked ballots (SELF-PAID) + re-vote ----------
+    await fundKda(friend.account, friend.publicKey);   // the voter pays their own gas
+    const r0 = await localCall(`(${T}.get-results "${pid}")`, HUB);
+    const K3 = (r0.options as string[]).length;
+    await send(selfPaid(friend,
+      `(${T}.cast-vote "${pid}" "${friend.account}" [0])`,
+      (wc) => [wc(`${T}.VOTE`, pid, friend.account)], {}, 'self-paid ranked ballot'));
+    const rv = await localCall(`(${T}.get-results "${pid}")`, HUB);
+    record('vote', 'member ranked [0] paying their own gas (+K*w points on option 0)',
+      rv.scores[0] === r0.scores[0] + K3 * sendAmt && rv.turnout === r0.turnout + sendAmt);
+    // re-vote REPLACES the ballot in place: [1 0] moves the top preference
+    await send(selfPaid(friend,
+      `(${T}.cast-vote "${pid}" "${friend.account}" [1 0])`,
+      (wc) => [wc(`${T}.VOTE`, pid, friend.account)], {}, 're-rank'));
+    const rv2 = await localCall(`(${T}.get-results "${pid}")`, HUB);
+    record('vote', 're-rank replaced the ballot ([0] -> [1,0]) with no double count',
+      rv2.scores[0] === r0.scores[0] + (K3 - 1) * sendAmt
+      && rv2.scores[1] === r0.scores[1] + K3 * sendAmt
+      && rv2.turnout === r0.turnout + sendAmt);
+    // a signer that doesn't match the voting account is refused (the VOTE cap
+    // guards the account; a different key can't vote as someone else)
+    const stranger = newKey();
+    await fundKda(stranger.account, stranger.publicKey);
+    const mismatch = await preflight(selfPaid(stranger,
+      `(${T}.cast-vote "${pid}" "${friend.account}" [0])`,
+      (wc) => [wc(`${T}.VOTE`, pid, friend.account)], {}, 'vote sig mismatch'));
+    record('vote', 'a signature not matching the voting account is refused', !mismatch.ok, mismatch.error.slice(0, 70));
+
+    // ---------- 7. vote KEY: hot key votes, cold key stays cold ----------
+    const hot = newKey();
+    await send(selfPaid(friend,
+      `(${T}.set-vote-key "${friend.account}" (read-keyset 'vk))`,
+      (wc) => [wc(`${T}.VOTE-KEY-ADMIN`, friend.account, `k:${hot.publicKey}`)],
+      { vk: { keys: [hot.publicKey], pred: 'keys-all' } }, 'register vote key'));
+    record('votekey', 'member registered a vote key under their MAIN guard',
+      Boolean(await localCall(`(at 'active (${T}.get-vote-key "${friend.account}"))`, HUB)));
+    await fundKda(hot.account, hot.publicKey);   // hot key pays its own vote gas
+    await send(selfPaid(hot,
+      `(${T}.cast-vote "${pid}" "${friend.account}" [2])`,
+      (wc) => [wc(`${T}.VOTE`, pid, friend.account)], {}, 'hot-key vote'));
+    const hkv = await localCall(`(${T}.get-ballot "${pid}" "${friend.account}")`, HUB);
+    const hkr = (hkv.ranking as any[]).map((v) => (typeof v === 'object' ? v.int : v));
+    record('votekey', 'HOT key ranked for the cold account (ballot recorded)', JSON.stringify(hkr) === JSON.stringify([2]), JSON.stringify(hkv).slice(0, 60));
+    // The receiver must ALREADY hold PCO. `transfer` reads the receiver row
+    // first, so sending to an account with no row aborts at that read - before
+    // the sender's guard is ever checked - and this negative would then pass for
+    // the wrong reason, proving nothing about the hot key.
+    const hotSteal = await preflight(selfPaid(hot,
+      `(${T}.transfer "${friend.account}" "${me.account}" 1.0)`,
+      (wc) => [wc(`${T}.TRANSFER`, friend.account, me.account, { decimal: '1.0' })], {}, 'hot-key transfer'));
+    record('votekey', 'hot key CANNOT transfer the cold account\'s tokens',
+      !hotSteal.ok && hotSteal.error.includes('Keyset failure'), hotSteal.error.slice(0, 60));
+    const hotRepoint = await preflight(selfPaid(hot,
+      `(${T}.set-vote-key "${friend.account}" (read-keyset 'vk2))`,
+      (wc) => [wc(`${T}.VOTE-KEY-ADMIN`, friend.account, `k:${hot.publicKey}`)],
+      { vk2: { keys: [hot.publicKey], pred: 'keys-all' } }, 'hot-key repoint'));
+    record('votekey', 'hot key CANNOT re-point the registration',
+      !hotRepoint.ok && hotRepoint.error.includes('Keyset failure'), hotRepoint.error.slice(0, 60));
+    await send(selfPaid(friend,
+      `(${T}.clear-vote-key "${friend.account}")`,
+      (wc) => [wc(`${T}.VOTE-KEY-ADMIN`, friend.account, '')], {}, 'clear vote key'));
+    const hotCleared = await preflight(selfPaid(hot,
+      `(${T}.cast-vote "${pid}" "${friend.account}" [0])`,
+      (wc) => [wc(`${T}.VOTE`, pid, friend.account)], {}, 'cleared hot vote'));
+    record('votekey', 'a cleared vote key can no longer vote',
+      !hotCleared.ok && hotCleared.error.includes('neither account guard nor registered vote key'),
+      hotCleared.error.slice(0, 60));
+
+  }
 
   // ---------- evidence ----------
-  const passed = checks.filter((c) => c.ok).length;
-  console.log(`\n${passed}/${checks.length} community-journey checks passed`);
-  if (passed !== checks.length) process.exitCode = 1;
+  // Skipped checks are reported separately and never counted as passes.
+  const skipped = checks.filter((c) => c.skipped);
+  const ran = checks.filter((c) => !c.skipped);
+  const passed = ran.filter((c) => c.ok).length;
+  console.log(`\n${passed}/${ran.length} community-journey checks passed` +
+    (skipped.length ? `  ·  ${skipped.length} SKIPPED (not measured in this run)` : ''));
+  if (passed !== ran.length) process.exitCode = 1;
 }
 
 main().catch((e) => { console.error('E2E ABORTED:', e.message ?? e); process.exit(1); });

@@ -73,7 +73,7 @@
 (env-keys ["ledger-a"])
 (expect "ops solo runs claim ops" "claims open" (free.pco-claim.set-open true))
 (expect "ops solo authors a governance question" "1"
-  (free.pco.create-proposal "ops-tier reachable" "b" ["a" "b"] 72))
+  (free.pco.create-proposal "1" "ops-tier reachable" "b" ["a" "b"] (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-04T12:00:00Z")))
 (rollback-tx)
 
 (begin-tx "1-of-2: the OTHER device operates too, so one lost device never halts ops")

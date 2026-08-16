@@ -3,3 +3,6 @@ ops/out/
 ops/mainnet-config.json
 *.log
 tests/.pc-history
+
+# mainnet submitters / one-off probes — NEVER commit (CW32)
+ops/src/_*

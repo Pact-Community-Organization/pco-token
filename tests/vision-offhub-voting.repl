@@ -1,0 +1,124 @@
+;; vision-offhub-voting.repl — PROMOTED 2026-08-14, now in the main suite.
+;;
+;; It was written as a must-fail file and it did fail, for the stated reason,
+;; until the chain-local voting design C2 landed. It now PASSES and is run with the other suites.
+;; The history below is kept deliberately: it records why the file exists and
+;; what its green does NOT mean, and both still apply.
+;;
+;; THE VISION PROPERTY (founder directive, 2026-08-13):
+;;   A PCO holder can cast a ballot from WHATEVER CHAIN their tokens are on.
+;;   Ranked-choice is unchanged. Claims and grants stay hub-only, deliberately.
+;;
+;; THIS FILE IS THE PROPERTY. It is not a bug report and not a wish: it is the
+;; named test that goes RED while the property is violated, which is the only
+;; thing that makes a vision property real (Rule 14c). Before it existed, NO test
+;; anywhere pinned voting location in EITHER direction - the suite stayed green
+;; whether governance was hub-only or global, so the original hub-only defect
+;; could never have been caught by running the tests. That is exactly how PCO
+;; shipped hub-only against a vote-on-all-chains vision: every test encoded the
+;; implementer's belief, so a wrong belief produced a green suite forever.
+;;
+;; WHY IT STARTED IN THE must-fail SET (kept, because the reasoning generalises).
+;; The property was not implemented yet, so the assertion below failed. Parking it
+;; in an un-run file would have let it rot; asserting the CURRENT behaviour would
+;; have pinned the defect as if it were the spec. The must-fail harness ran it on
+;; every suite run AND asserted it failed for the STATED REASON, so a failure for
+;; some unrelated reason would itself have been reported - the file could not
+;; quietly stop testing. When C2 landed the harness reported "LOADED", which was
+;; the tripwire saying the property now holds and the file must be promoted.
+;;
+;; 🔴 IT MUST NEVER GO GREEN FOR THE WRONG REASON. Now that it is an ordinary
+;; suite file, a green means the assertion passed - it no longer proves anything
+;; about WHY. If cross-chain voting were ever reverted, this file is what goes
+;; red. Do not "fix" that red by deleting or weakening the file: it is the only
+;; proof the property holds, and deleting it returns the suite to the state that
+;; let hub-only voting ship against a vote-on-all-chains vision in the first place.
+;;
+;; WHAT IT DOES NOT COVER, stated so nobody mistakes a green for more than it is:
+;;   * It proves a ballot can be CAST off-hub. It does NOT prove the same tokens
+;;     cannot be counted twice across two chain-copies of one question - that
+;;     needs one shared absolute deadline on all 20 copies, and is pinned
+;;     separately by vision-shared-deadline.repl-must-fail.
+;;   * A bare REPL cannot exercise a real cross-chain transfer (no SPV), so the
+;;     multi-chain interaction is a devnet question, not a REPL one.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "namespace + keyset + deploy")
+(env-data
+  { "ns": "free", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "pco-ops": { "keys": ["ledger-a"], "pred": "keys-all" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(commit-tx)
+
+(begin-tx "ops authority + mint + fund one off-hub holder")
+(env-data { "ns": "free"
+          , "pco-ops": { "keys": ["ledger-a"], "pred": "keys-all" }
+          , "holder": { "keys": ["holder-key"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco.set-ops-guard (read-keyset 'pco-ops))
+(free.pco.init-mint
+  [ { "account": (free.pco.reserve-account)
+    , "guard": (keyset-ref-guard "free.pco-gov"), "amount": 1000000.0 } ])
+(env-sigs
+  [ { "key": "ledger-a", "caps": [(free.pco.TRANSFER "r:free.pco-gov" "holder" 1000.0)] }
+  , { "key": "ledger-b", "caps": [(free.pco.TRANSFER "r:free.pco-gov" "holder" 1000.0)] } ])
+(free.pco.transfer-create "r:free.pco-gov" "holder" (read-keyset 'holder) 1000.0)
+(commit-tx)
+
+;; The question is authored by ops, as it is today - the authoring model is NOT
+;; part of this change and must not drift into it.
+(begin-tx "ops opens a ranked question")
+(env-data { "ns": "free" })
+(env-keys ["ledger-a"])
+(env-sigs [{ "key": "ledger-a", "caps": [] }])
+(expect "a ranked question opens"
+  "1"                                          ; create-proposal returns the pid
+  (free.pco.create-proposal "1" "Which template family next?" "vision property fixture"
+    ["marketplace" "vesting" "oracle"]
+    (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-08T12:00:00Z")))   ; duration is HOURS, not seconds
+(commit-tx)
+
+;; ---------------------------------------------------------------- THE PROPERTY
+;; The holder's tokens are on chain 1. Under the vision they vote from chain 1.
+;;
+;; NOTE the weight assertion is deliberately part of the property, not decoration:
+;; "vote from the chain your tokens are on" is only meaningful if the ballot is
+;; weighted by the balance ON THAT CHAIN. A build that let the call through but
+;; weighted it from somewhere else would satisfy a laxer test and miss the point.
+(begin-tx "the holder votes from chain 1, where their tokens are")
+(env-chain-data { "chain-id": "1", "block-time": (time "2026-08-01T12:00:01Z") })
+(env-data { "ns": "free" })
+(env-keys ["holder-key"])
+(env-sigs [{ "key": "holder-key", "caps": [] }])
+
+;; THE ASSERTION THE WHOLE FILE EXISTS FOR. Until C2 this aborted with
+;; "governance lives on the hub chain only", raised by the enforce-hub call that
+;; cast-vote-internal made; run.sh asserted on that exact string. enforce-hub is
+;; now deleted, so the ballot is accepted and this line is the thing that would
+;; go red if voting were ever re-restricted to the hub.
+(expect "a holder can cast a ranked ballot from a chain other than the hub"
+  "vote recorded"
+  (free.pco.cast-vote "1" "holder" [0 1 2]))
+
+(expect "and the ballot is weighted by the balance ON THAT CHAIN"
+  1000.0
+  (at 'weight (free.pco.get-ballot "1" "holder")))
+(commit-tx)

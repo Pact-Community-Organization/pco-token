@@ -1,4 +1,4 @@
-;; pairwise.repl — the head-to-head (Condorcet) tally: ADR-PCO-012.
+;; pairwise.repl — the head-to-head (Condorcet) tally: the chain-local voting design.
 ;;
 ;; The property this whole aggregate exists for: a ballot's contribution to its
 ;; FAVOURITE's duels does not depend on how much of the ballot the voter filled
@@ -80,9 +80,11 @@
 (env-keys ["ledger-a"])
 (env-sigs [{ "key": "ledger-a", "caps": [] }])
 (expect "pid 1" "1"
-  (free.pco.create-proposal "Which template family next?" "real devnet case"
-    ["vesting" "oracle" "marketplace"] 720))
+  (free.pco.create-proposal "1" "Which template family next?" "real devnet case"
+    ["vesting" "oracle" "marketplace"]
+    (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-31T12:00:00Z")))
 (commit-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })  ; inside the voting window
 
 (expect "P5 a fresh matrix is K*K zeros" 9
   (length (at 'pairs (free.pco.get-head-to-head "1"))))
@@ -231,8 +233,10 @@
 (env-keys ["ledger-a"])
 (env-sigs [{ "key": "ledger-a", "caps": [] }])
 (expect "pid 2" "2"
-  (free.pco.create-proposal "cycle" "A>B>C, B>C>A, C>A>B" ["A" "B" "C"] 720))
+  (free.pco.create-proposal "2" "cycle" "A>B>C, B>C>A, C>A>B" ["A" "B" "C"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-09-01T00:00:01Z")))
 (commit-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-02T00:00:02Z") })  ; inside the second question's window
 (begin-tx "cycle ballots")
 (env-keys ["c1-key"]) (env-sigs [{ "key": "c1-key", "caps": [] }])
 (free.pco.cast-vote "2" "cyc1" [0 1 2])
@@ -283,4 +287,4 @@
 (expect "P9 matrix length still matches K*K" 9
   (length (at 'pairs (free.pco.get-head-to-head "2"))))
 
-(print "pairwise.repl: head-to-head tally verified (ADR-PCO-012)")
+(print "pairwise.repl: head-to-head tally verified (the chain-local voting design)")

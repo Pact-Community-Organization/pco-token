@@ -1,99 +1,23 @@
 ;; pco.pact — the PCO community governance token (PCO).
 ;;
 ;; A free, deliberately valueless community token: fixed supply, one-shot
-;; mint, live-balance advisory voting. It confers NO dividends, NO revenue
-;; rights, NO claim on anyone or anything. Votes EXECUTE NOTHING on-chain:
-;; tallies are a permanently recorded advisory signal about PCO tooling
-;; direction, nothing more.
-;;
-;; Derived from the PCO catalog template library/token-fixed-supply-gov
-;; (audited), with three deliberate deltas for a 20-chain deployment:
-;;   1. GOVERNANCE = the <ns>.pco-gov keyset (a 2-of-3 hardware keyset).
-;;      The module is upgradeable under that keyset; flipping FROZEN-MODULE
-;;      to true and redeploying freezes it permanently.
-;;   2. Cross-chain transfers ENABLED (fungible-xchain-v1, 2-step SPV
-;;      defpact). Voting stays sound because every debit — including the
-;;      step-0 cross-chain debit — releases the moved weight from open
-;;      tallies, and credits always arrive unvoted.
-;;   3. Governance is HUB-CHAIN-ONLY (chain 0): proposals and votes exist
-;;      only where the deep liquidity is minted, so no cross-chain
-;;      double-vote surface exists at all. Tokens may live on any chain;
-;;      voting weight is the voter's hub-chain balance.
+;; mint, live-balance advisory ranked-choice voting. It confers NO dividends,
+;; NO revenue rights, NO claim on anyone or anything; votes execute nothing
+;; on-chain — tallies are a permanently recorded advisory signal only.
 (namespace (read-msg 'ns))
 
 (module pco GOVERNANCE
 
   @doc "PCO community governance token: fixed-supply fungible-v2 +          \
-  \fungible-xchain-v1 with ADVISORY ranked-choice live-vote governance.      \
-  \                                                                          \
-  \GOVERNANCE MODEL - admin-authored questions, community-ranked answers:    \
-  \  * Proposals are RANKED-CHOICE questions (2..5 named options) created    \
-  \    by the org (ops tier; governance keyset always works). The community  \
-  \    suggests questions on the public channels; the org puts them          \
-  \    on-chain. RATIONALE: with 3 global slots, OPEN proposing needs stake  \
-  \    locks + admin cancel/seize backstops to survive funded               \
-  \    slot-squatting - admin involvement is structural either way, so v1    \
-  \    takes honest full control (the open design is parked for a future     \
-  \    version).                                                             \
-  \  * Voters RANK options; tallies are live per-option BORDA scores: a      \
-  \    ballot ranking option i at position p contributes weight*(K-p)        \
-  \    points, maintained incrementally on vote, re-vote and release         \
-  \    (instant-runoff can be recomputed off-chain from the public           \
-  \    ballots).                                                             \
-  \                                                                          \
-  \The live-vote discipline, in full:                                        \
-  \  * A ballot's weight is the voter's CURRENT hub-chain balance;           \
-  \    re-voting replaces the ballot in place.                               \
-  \  * Every balance DECREASE (transfer out, cross-chain send)               \
-  \    automatically releases the moved weight from the account's ballots on \
-  \    every OPEN proposal, so tokens that moved away can never keep voting. \
-  \  * Received tokens arrive UNVOTED: credits never touch scores.           \
-  \  * release-votes is deliberately PUBLIC: it derives everything from the  \
-  \    account's REAL balance, so it can only shrink stale weights.          \
-  \  * At most MAX-ACTIVE-PROPOSALS are open at once, bounding the release   \
-  \    work added to any debit.                                              \
-  \                                                                          \
-  \Votes EXECUTE NOTHING. Scores are advisory community signals about PCO    \
-  \tooling direction; no quorum is enforced — readers judge turnout.         \
-  \                                                                          \
-  \Two accounts are barred from voting, and BY NAME. There is no rule about  \
-  \principal TYPES here: an earlier design refused every code-held tag       \
-  \(`m:`, `c:`, `u:`, `p:`, `r:`) as an allowlist, and that rule is GONE -   \
-  \it was deleted, not weakened, and this paragraph described it for 1,000   \
-  \lines after the enforcing line stopped existing. What actually holds:     \
-  \the community reserve is refused by a hardcoded enforce in                \
-  \cast-vote-internal, and every other excluded escrow is refused through    \
-  \the `non-voting` register, whose rows are written by the module that OWNS \
-  \the escrow, at its own deploy (see register-non-voting). That is how      \
-  \`pco` learns the claim pool's principal without naming `pco-claim`, a     \
-  \module which depends on this one and so could not be named here. What     \
-  \disqualifies the pool is that it holds UNDISTRIBUTED community tokens,    \
-  \not that it happens to be module-guarded: a type rule would also          \
-  \disenfranchise participants who legitimately hold through a contract,     \
-  \and would still miss an escrow held under an ordinary name.               \
-  \These are NAME checks, not locks on governance: while this module is      \
-  \unfrozen the                                                              \
-  \community keyset can move escrowed or reserve tokens to an ordinary       \
-  \account and vote them. That route at least emits a public TRANSFER event; \
-  \module admin can also write balances and scores directly, emitting        \
-  \nothing. FROZEN-MODULE removes only the SILENT route: with both modules   \
-  \frozen the ops tier can still grant pool tokens to an account and vote    \
-  \them, which is evented and publicly auditable but not prevented. The      \
-  \freeze buys detectability, not governance neutrality.                     \
-  \                                                                          \
-  \An account may register an OPTIONAL dedicated vote key (a hot key that    \
-  \can ONLY vote) under its main guard; transfers, rotation, and the         \
-  \registration itself always require the main guard.                        \
-  \                                                                          \
-  \Supply accounting is PER CHAIN: chain-minted describes THIS chain's       \
-  \ledger only. The mint happens once, on the hub chain; there is no burn    \
-  \path and no second mint through any function. Supply is fixed by          \
-  \CONSTRUCTION against every caller — the only balance increases are fused  \
-  \to a real debit, or behind the one-shot MINT keyset — but NOT against     \
-  \governance itself, which can acquire module admin and write balances      \
-  \directly while the module is unfrozen. Fixed supply becomes an enforced   \
-  \property, rather than a disclosed intention, only at the FROZEN-MODULE    \
-  \flip."
+  \fungible-xchain-v1 with ADVISORY ranked-choice live-vote governance -     \
+  \admin-authored questions (ops tier), ballots weighted by the voter's      \
+  \CURRENT balance on the chain the vote is cast from, every balance         \
+  \decrease releasing the moved weight from open tallies, credits arriving   \
+  \unvoted, and the reserve plus every registered escrow barred BY NAME.     \
+  \Votes execute nothing; supply is fixed by construction against every      \
+  \caller - every balance increase is fused with a real debit, behind the    \
+  \one-shot MINT keyset, or in the cross-chain resume - and becomes enforced \
+  \against governance itself only at the FROZEN-MODULE flip."
 
   (implements fungible-v2)
   (implements fungible-xchain-v1)
@@ -108,6 +32,11 @@
   (defconst ADMIN-KS:string (format "{}.pco-gov" [NS])
     "The community governance keyset (2-of-3 hardware keys). Rotating the \
     \keyset definition rotates every right this module grants it.")
+
+  ;; Bless lines are APPEND-ONLY: every deployed hash stays blessed, so
+  ;; in-flight cross-chain transfers and stale dependent pins (pco-claim runs
+  ;; its pinned copy of pco until its own redeploy lands) can always resolve.
+  (bless "dhaabVg6xcckPSQjxeE_berIoILRcJb4XKOa6qeClLs")
 
   ;; GENERATED FIXTURE - do not edit; see fixtures/make-frozen-pco.sh
   (bless "DldRwCblQ7Loqy6wYJnaodHl30d3j3eH-qtFzfEv46g")
@@ -124,21 +53,22 @@
   ;; Deploy-time constants
   ;; -----------------------------
 
-  (defconst SYMBOL (read-string 'symbol)
-    "Display symbol, fixed at deploy.")
+  ;; SYMBOL, PRECISION and TOTAL-SUPPLY are LITERALS, not deploy parameters:
+  ;; a defconst is re-evaluated on every module load and an upgrade (including
+  ;; the freeze) is a module load, so a data-block value could be silently
+  ;; restated by any upgrade. `NS` stays a deploy parameter deliberately - it
+  ;; is the one value that genuinely differs between networks.
 
-  (defconst PRECISION:integer
-    (let ((p (read-integer 'precision)))
-      (enforce (and (>= p 0) (<= p 12)) "precision must be in 0..12")
-      p)
-    "Decimal precision, fixed at deploy (12 matches coin).")
+  (defconst SYMBOL "PCO"
+    "Display symbol. A literal, so it cannot be redefined by an upgrade.")
 
-  (defconst TOTAL-SUPPLY:decimal
-    (let ((s (read-decimal 'total-supply)))
-      (enforce (> s 0.0) "total-supply must be positive")
-      (enforce (= (floor s PRECISION) s) "total-supply must respect precision")
-      s)
-    "The fixed supply: minted exactly once (hub chain), never changed after.")
+  (defconst PRECISION:integer 12
+    "Decimal precision (12 matches coin). A literal: an upgrade carrying a     \
+    \smaller value would make finer-grained balances permanently unspendable.")
+
+  (defconst TOTAL-SUPPLY:decimal 1000000.0
+    "The fixed supply: minted exactly once (hub chain), never changed after.    \
+    \A literal, so no upgrade can restate it.")
 
   (defconst OPS-KEY:string "ops"
     "Singleton row key for the ops-authority table.")
@@ -146,43 +76,52 @@
   (defconst EMPTY-KEYSET-PREFIX:string
     "w:DldRwCblQ7Loqy6wYJnaodHl30d3j3eH-qtFzfEv46g"
     "Principal prefix shared by EVERY keyset with an empty key list (the     \
-    \key-list hash is a constant, so the predicate is the only thing that   \
-    \varies after it). `keys-all` over zero keys is vacuously TRUE, so such \
-    \a keyset is satisfied by a caller signing nothing; set-ops-guard       \
-    \refuses the whole shape. Verified in tests/ops-recovery.repl.")
+    \key-list hash is a constant). `keys-all` over zero keys is vacuously    \
+    \TRUE, so such a keyset is satisfied by a caller signing nothing;        \
+    \set-ops-guard refuses the whole shape.")
 
   (defconst MAX-OPTIONS 5
     "Most options a ranked-choice question may carry (bounds ballot and     \
     \release work; 2 options = a plain either/or question).")
 
   (defconst GOV-CHAIN:string "0"
-    "The hub chain: the one-shot mint, all proposals and all votes live here.")
+    "The hub chain: the one-shot mint lives here, and pco-claim's pool. It \
+    \does NOT gate proposals or votes, which are chain-local.")
 
   (defconst RESERVE-ACCOUNT:string
     (create-principal (keyset-ref-guard ADMIN-KS))
-    "The community reserve account (r: principal of the governance keyset).  \
-    \Rotating the keyset re-points this account's control automatically.     \
-    \Barred from voting on-chain BY NAME - and that bar is a name check, not \
-    \a lock on admin voting power. Governance                                \
-    \controls this account, so it can move the reserve to an ordinary        \
-    \account in one transaction and vote it; after close+sweep it could do   \
-    \the same with the undistributed pool. That ROUTE at least emits a       \
-    \public TRANSFER event.                                                  \
-    \Do NOT infer a visibility guarantee from that:                          \
-    \while this module is unfrozen, governance can also acquire module admin \
-    \and write scores, turnout, ballots and balances DIRECTLY, emitting NO   \
-    \events at all. Unlike an upgrade - which changes the module hash and is \
-    \loudly detectable - that leaves no trace an observer can key on.        \
-    \The FROZEN-MODULE flip closes that SILENT route, and only that route:   \
-    \verified by execution, a frozen pair still lets the ops tier grant pool \
-    \tokens to an ordinary account and vote them. After the freeze every     \
-    \such move is evented and auditable; it is not prevented.")
+    "The community reserve account (r: principal of the governance keyset);  \
+    \rotating the keyset re-points its control automatically. Barred from    \
+    \voting BY NAME - a name check, not a lock on admin voting power:        \
+    \governance can move the reserve to an ordinary account and vote it      \
+    \(publicly evented), and while the module is unfrozen module admin can   \
+    \also write scores and balances directly, emitting nothing. The          \
+    \FROZEN-MODULE flip closes only that silent route - it buys              \
+    \detectability, not governance neutrality.")
 
   (defconst MIN-VOTE-HOURS 24
-    "Shortest allowed voting window.")
+    "Shortest allowed voting window: ends-at must be at least this far after \
+    \starts-at. The 20 copies close at ONE absolute instant, so a short      \
+    \window can shut out a holder on a chain with slow block production.")
 
   (defconst MAX-VOTE-HOURS 720
-    "Longest allowed voting window (30 days).")
+    "Longest a question may run: 30 days from starts-at to ends-at. Also the \
+    \longest a mistyped ends-at can hold one of MAX-ACTIVE-PROPOSALS slots:  \
+    \cancellation is refused once voting opens, so there is no close path.")
+
+  (defconst MIN-ANNOUNCE-HOURS 12
+    "Least notice between authoring a question and voting opening on it. It  \
+    \buys two things: every one of the 20 copies can be landed and verified  \
+    \before the first ballot, and pre-start cancellation has a real window   \
+    \to act in. It does NOT make the copies start together; only the         \
+    \absolute starts-at does that.")
+
+  (defconst CREATED-SKEW-SECONDS 3600
+    "How far the caller-supplied created-at may sit from this chain's own    \
+    \block time, in either direction: too far forward fabricates the         \
+    \announce window, too far back dodges the 12-hour floor by backdating.   \
+    \One hour covers the 20-chain spread plus a retried transaction, leaving \
+    \an effective floor of 11 hours in the worst case.")
 
   (defconst MAX-ACTIVE-PROPOSALS 3
     "Open-proposal cap: bounds the release work on every balance decrease.")
@@ -234,8 +173,13 @@
     title:string
     body:string
     options:[string]
-    created:time
-    close-at:time
+    ;; Three ABSOLUTE instants, identical on all 20 chains: supplied by the
+    ;; caller, never derived from local block time - a deadline computed from
+    ;; "now" gives 20 different deadlines, which is a double-vote hole.
+    created:time                      ; when the operator says it was authored
+    starts-at:time                    ; voting opens - >= created + MIN-ANNOUNCE-HOURS
+    ends-at:time                      ; voting closes - [MIN-VOTE-HOURS, MAX-VOTE-HOURS] after starts-at
+    cancelled:bool                    ; voided before it started; never re-opened
     scores:[decimal]
     turnout:decimal)
 
@@ -253,25 +197,11 @@
   (defschema rcv-margin
     @doc "The AUTHORITATIVE head-to-head record for one question: a K x K matrix \
          \flattened row-major, where m[i*K + j] is the total ballot weight that   \
-         \prefers option i to option j. The diagonal stays 0.0 forever.           \
-         \                                                                        \
-         \WHY THIS EXISTS (see also the borda-apply docstring). Under the Borda   \
-         \scores alone, truncating a ballot is strictly dominant: a ballot of     \
-         \length 1 gives its favourite a margin of w*K over the strongest rival,  \
-         \while a full ranking gives w*1. That penalises honesty and makes the    \
-         \published number a function of ballot DEPTH as much as of preference.   \
-         \A pairwise cell has no such lever: a ballot that ranks i first credits  \
-         \m[i][j] with its full weight whether or not j is ranked, so [i] and     \
-         \[i,j,k] produce IDENTICAL i-vs-j and i-vs-k cells. Only the j-vs-k cell \
-         \moves. Truncation therefore costs a voter influence over races they did \
-         \not rank and gains them nothing anywhere - a fuller sincere ballot is   \
-         \weakly better, which is the exact inverse of the Borda incentive.       \
-         \                                                                        \
-         \READ THE CELLS, NOT A SUMMARY. Only the individual pairwise cells are   \
-         \depth-neutral; every scalar reduction of this matrix (row sums, net     \
-         \margins) reintroduces a length bonus and throws the property away.      \
-         \Copeland win-counts in get-head-to-head are computed FROM the cells and \
-         \are a readout, never the stored quantity."
+         \prefers option i to option j (the diagonal stays 0.0 forever). The      \
+         \pairwise cells are depth-neutral - a partial ballot credits the same    \
+         \i-vs-j cells as a full one - which the Borda scores are not. READ THE   \
+         \CELLS, NOT A SUMMARY: every scalar reduction (row sums, net margins)    \
+         \reintroduces a ballot-length bonus and throws the property away."
     m:[decimal])
 
   (deftable rcv-margins:{rcv-margin})       ; key = proposal id
@@ -298,27 +228,21 @@
 
   (defschema ops-authority
     @doc "The routine-operations authority, held as module STATE rather than \
-         \as a named keyset. This is deliberate: a named keyset can only be  \
-         \redefined by satisfying ITSELF, so a compromised ops device could  \
-         \re-point it beyond governance's reach, and a LOST ops device could \
-         \never be replaced at all - both recoverable only by a code         \
-         \upgrade. Holding the authority here makes it governance-owned:     \
-         \ops can never change it, and governance can always replace it."
+         \a named keyset: a named keyset can only be redefined by satisfying \
+         \ITSELF, so a compromised ops device could re-point it and a lost   \
+         \one could never be replaced. Held here it is governance-owned: ops \
+         \can never change it, and governance can always replace it."
     guard:guard)
 
   (deftable ops-auth:{ops-authority})       ; singleton, key = OPS-KEY
 
   (defschema non-voting-row
     @doc "An account registered as OUTSIDE THE FLOAT: an escrow holding tokens \
-         \that are not yet anybody's, so they carry no voice. Keyed by account. \
-         \                                                                      \
-         \Registered BY NAME, deliberately, rather than inferred from the       \
-         \account's guard type. What disqualifies the claim pool is what it     \
-         \HOLDS - undistributed community tokens - not how it is guarded, and a \
-         \rule about guard types would both disenfranchise participants who     \
-         \hold through a contract and miss an escrow kept under an ordinary     \
-         \name. The register is public, so anyone can read exactly which        \
-         \accounts are excluded and check the list against the supply."
+         \that are not yet anybody's, so they carry no voice. Registered BY     \
+         \NAME, never inferred from the guard type - what disqualifies an       \
+         \escrow is what it HOLDS, and a type rule would disenfranchise         \
+         \legitimate contract-held balances while missing an escrow under an    \
+         \ordinary name. The register is public and auditable against supply."
     reason:string)
 
   (deftable non-voting:{non-voting-row})
@@ -331,17 +255,11 @@
     @doc "Internal debit permission: enforces the sender's account guard."
     (enforce-guard (at 'guard (read accounts sender))))
 
-  ;; NOTE: there is deliberately NO `CREDIT` capability, and no marker
-  ;; capability of any kind on the credit side. House rule: a capability body IS
-  ;; the authorization decision, so a body that is trivially satisfiable states
-  ;; nothing and must never be treated as a gate. A marker that gates nothing is
-  ;; worse than no marker, because it reads like protection.
-  ;; THE INVARIANT, which is what actually protects supply: a balance may rise
-  ;; ONLY inside `transfer-create` (lexically fused with a real DEBIT, so supply
-  ;; is conserved by construction), inside `init-mint` (behind the MINT keyset,
-  ;; one-shot), or in the cross-chain receive resume (which requires a real SPV
-  ;; continuation). Keep every balance increase inside one of those three, and
-  ;; do not add a standalone credit path.
+  ;; Deliberately NO `CREDIT` capability: a trivially satisfiable cap body
+  ;; gates nothing and reads like protection. THE INVARIANT protecting supply:
+  ;; a balance may rise ONLY inside `transfer-create` (fused with a real
+  ;; DEBIT), `init-mint` (MINT keyset, one-shot), or the cross-chain receive
+  ;; resume (real SPV continuation). Never add a standalone credit path.
 
   (defcap MINT ()
     @doc "The one-shot initial mint, authorized by the community keyset.  \
@@ -350,29 +268,17 @@
 
   (defcap VOTE-KEY-ADMIN (account:string vote-authority:string)
     @doc "Owner gate for vote-key registration/clearing: the account's MAIN  \
-         \guard, nobody else's — the hot key can never re-point itself. A    \
-         \defcap (not a bare enforce) so wallets can SCOPE the signature to  \
-         \exactly this action.                                               \
-         \VOTE-AUTHORITY is the principal of the key being registered, or    \
-         \\"\" when clearing. It is in the capability because the registered \
-         \guard itself travels in tx DATA, which no wallet displays: without \
-         \it, a compromised page could register an ATTACKER's voting key     \
-         \under a signature the user checked and found correct. With it, a   \
-         \substituted key changes what the wallet shows."
+         \guard, nobody else's - the hot key can never re-point itself.      \
+         \VOTE-AUTHORITY (the new key's principal, or \"\" when clearing) is \
+         \in the capability because the registered guard travels in tx DATA, \
+         \which no wallet displays: with it, a substituted key changes what  \
+         \the wallet shows."
     (enforce-guard (at 'guard (read accounts account))))
 
-  ;; EVENT CAPABILITIES. Every one of these carries a real body, by house rule:
-  ;; an @event cap authorizes nothing - it only stamps the log - but a body that
-  ;; asserts nothing makes the event meaningless, so each one requires the
-  ;; capability that authorized the underlying action.
-  ;;
-  ;; HONEST LIMIT: that binds the AUTHORITY, not the PAYLOAD. Holding the right
-  ;; to act for an account does not constrain the numbers a caller puts in the
-  ;; event it emits. An event therefore proves that someone entitled to act did
-  ;; so; it does not prove the figures inside it.
-  ;; Anything published from this log must be reconciled against table state.
-  ;; (Today nothing consumes these events: ops/src/distinct-voters.ts computes
-  ;; turnout by reading the rcv-ballots TABLE, not by scanning blocks.)
+  ;; EVENT CAPABILITIES. Each carries a real body: an @event cap authorizes
+  ;; nothing, so each requires the capability that authorized the underlying
+  ;; action. That binds the AUTHORITY, not the PAYLOAD - reconcile anything
+  ;; published from this log against table state.
 
   (defcap VOTE-KEY-SET (account:string key:string)
     @event
@@ -388,13 +294,9 @@
   (defcap ROTATE (account:string new-authority:string)
     @doc "Guard-rotation authorization: the account's CURRENT guard, scoped  \
          \to the account AND to the principal of the guard it is rotating    \
-         \TO. Binding the destination matters: the new guard travels in tx   \
-         \DATA, which no wallet displays, so a capability naming only the    \
-         \account would let a compromised page install an ATTACKER's key     \
-         \while the signature the user reviewed looked exactly right. With   \
-         \NEW-AUTHORITY in the capability, substituting the key changes what \
-         \the wallet shows, and a signature scoped to the intended new owner \
-         \cannot be spent on a different one."
+         \TO. The new guard travels in tx DATA, which no wallet displays;    \
+         \with NEW-AUTHORITY in the capability, a substituted key changes    \
+         \what the wallet shows."
     (enforce-guard (at 'guard (read accounts account))))
 
   (defun ops-guard:guard ()
@@ -427,37 +329,15 @@
     (require-capability (NON-VOTING-ADMIN)))
 
   (defcap PROPOSAL-OPS ()
-    @doc "Proposal administration gate: proposals are ADMIN-AUTHORED (the    \
-         \community suggests questions on the public channels; the org puts  \
-         \them on-chain). Routine tier: the ops authority creates and        \
-         \cancels questions; the 2-of-3 governance keyset ALWAYS satisfies   \
-         \this too, and is tried FIRST, so a broken or hostile ops authority \
-         \can never lock governance out. DESIGN RATIONALE: open community    \
-         \proposing was analysed and parked - with 3 global slots, any open  \
-         \design needs stake locks plus admin cancel/seize backstops to      \
-         \survive funded slot-squatting, at which point admin involvement is \
-         \already structural; v1 takes honest full control instead."
-    ;; BRANCH ORDER IS LOAD-BEARING - do not "tidy" it back.
-    ;;
-    ;; The ops branch reads `ops-auth` (inside ops-guard). On a chain where
-    ;; that table does not exist - an upgrade-mode deploy that predates it -
-    ;; the read raises a DATABASE error, and a database error is NOT
-    ;; contained: `try` does not catch it and `enforce-one` does not swallow
-    ;; it. Measured both ways on pact 5.4.
-    ;;
-    ;; This cap used to hoist that read into a `let` ABOVE the enforce-one,
-    ;; which meant it ran before EITHER branch. Measured consequence: with the
-    ;; full 2-of-3 governance keyset satisfied, create-proposal aborted with
-    ;; "Table <ns>.pco_ops-auth not found" - so the governance tier was locked
-    ;; out of set-open (the master kill switch), create-round and grant, and
-    ;; set-ops-guard could not repair it because its write hits the same table.
-    ;; The docstring above promised the opposite of what the code did.
-    ;;
-    ;; With the keyset branch FIRST and the read INSIDE the second branch,
-    ;; enforce-one short-circuits and a satisfied governance keyset returns
-    ;; before the read is ever reached. Same shape as
-    ;; pco-gas-station.station-guard-pred, which got this right first.
-    ;; Cost: one failed keyset check per ops-tier call.
+    @doc "Proposal administration gate: proposals are ADMIN-AUTHORED - the   \
+         \ops authority creates and cancels questions. The 2-of-3 governance \
+         \keyset ALWAYS satisfies this too, and is tried FIRST, so a broken  \
+         \or hostile ops authority can never lock governance out."
+    ;; BRANCH ORDER IS LOAD-BEARING - admin first, do not "tidy" it back.
+    ;; The ops branch reads `ops-auth` (inside ops-guard); on a chain missing
+    ;; that table the read raises a DATABASE error, which neither `try` nor
+    ;; `enforce-one` contains. Keyset first means a satisfied governance
+    ;; keyset returns before the read is ever reached.
     (enforce-one "governance or ops authority required"
       [ (enforce-keyset ADMIN-KS)
         (enforce-guard (ops-guard)) ]))
@@ -468,21 +348,12 @@
          \an unscoped signature to vote. The MAIN guard is tried FIRST, so   \
          \neither a hostile registration NOR a missing vote-delegates table  \
          \can lock an owner out of voting."
-    ;; BRANCH ORDER IS LOAD-BEARING - do not "tidy" it back.
-    ;;
-    ;; The vote-key branch reads `vote-delegates`. This cap used to hoist that
-    ;; read into a `let*` ABOVE the enforce-one, so it ran before EITHER branch.
-    ;; Measured on pact 5.4: on a chain where that table does not exist (an
-    ;; upgrade-mode deploy predating it - the P3b case), a holder could not vote
-    ;; with their OWN main account guard; cast-vote aborted with
-    ;; "Table <ns>.pco_vote-delegates not found". The docstring promised the
-    ;; opposite. A database error is contained by neither `try` nor `enforce-one`,
-    ;; so the only fix is to not perform the read until the branch needs it.
-    ;;
-    ;; Reads are safe HERE, in an enforce-one branch, on BOTH node lineages -
-    ;; devnet-verified on KDA-CE 3.1 and upstream 2.29 (enforce-one's condition
-    ;; environment is laxer than plain `enforce`'s). The let-bind house rule
-    ;; applies to a read inside an `enforce` CONDITION, which this is not.
+    ;; BRANCH ORDER IS LOAD-BEARING - main guard first, do not "tidy" it back.
+    ;; The vote-key branch reads `vote-delegates`; on a chain missing that
+    ;; table the read raises a DATABASE error, which neither `try` nor
+    ;; `enforce-one` contains - never hoist the read above the enforce-one.
+    ;; (A read inside an enforce-one BRANCH is fine on both node lineages;
+    ;; the let-bind house rule covers reads inside an `enforce` CONDITION.)
     ;; `active` is enforced BEFORE the guard, so the default guard below is
     ;; unreachable and exists only to satisfy with-default-read's binding.
     (enforce-one "neither account guard nor registered vote key satisfied"
@@ -493,7 +364,7 @@
           (enforce a "no active vote key")
           (enforce-guard g)) ]))
 
-  (defcap GOV-PROPOSED (id:string title:string options:[string] close-at:time)
+  (defcap GOV-PROPOSED (id:string title:string options:[string] starts-at:time ends-at:time)
     @event
     (require-capability (PROPOSAL-OPS)))
 
@@ -522,19 +393,11 @@
     @managed amount TRANSFER_XCHAIN-mgr
     (enforce (> amount 0.0) "cross-chain amount must be positive")
     (enforce-unit amount)
-    ;; a yield to a nonexistent chain would destroy the debited tokens with
-    ;; no burn accounting - only real chains may be targeted, via coin's own
-    ;; chain set rather than a list retyped here.
-    ;; PRECISELY WHAT THAT BUYS, because an earlier version of this comment
-    ;; overclaimed it ("coin's own canonical chain set, never a hardcoded copy"):
-    ;; a foreign defconst is INLINED AT THIS MODULE'S COMPILE TIME, so what is
-    ;; embedded is a COPY frozen at pco's deploy - measured on pact 5.4. Two
-    ;; consequences, both worth knowing:
-    ;;   * GOOD: a later `coin` upgrade cannot change or break this check, and
-    ;;     VALID_CHAIN_IDS is pco's only reference into `coin` at all.
-    ;;   * LIMIT: if Kadena ever runs more than these chains, pco must be
-    ;;     REDEPLOYED to reach them - impossible once FROZEN-MODULE is set. The
-    ;;     error direction is fail-safe (over-restrictive, never permissive).
+    ;; A yield to a nonexistent chain would destroy the debited tokens with no
+    ;; burn accounting, so only real chains may be targeted. coin.VALID_CHAIN_IDS
+    ;; is a foreign defconst, INLINED at this module's compile time - a copy
+    ;; frozen at deploy: a later `coin` upgrade cannot break the check, and new
+    ;; chains need a redeploy (fail-safe: over-restrictive, never permissive).
     (enforce (contains target-chain coin.VALID_CHAIN_IDS)
       "target chain is not a valid chain id")
     (enforce (!= (at 'chain-id (chain-data)) target-chain)
@@ -549,23 +412,11 @@
       (sender:string receiver:string amount:decimal source-chain:string)
     @event
     ;; Required by fungible-xchain-v1 and emitted from the cross-chain RESUME,
-    ;; where by construction no capability is held - the continuation's authority
-    ;; IS the SPV proof, which is not expressible as a capability. So unlike the
-    ;; other event caps this one cannot require an authorizing capability.
-    ;; HONEST LIMIT, and it is stronger than "not proof": A THIRD PARTY CAN
-    ;; FABRICATE ONE OF THESE FROM NOTHING. Every check below is satisfiable by
-    ;; an uninvolved caller, and this capability - uniquely among ours - has no
-    ;; authorizing capability it can require. Measured: a phantom 250,000-PCO
-    ;; arrival, stamped with pco's real module hash, for a transfer that never
-    ;; existed.
-    ;; So NEVER read this event as evidence of anything - reconcile against
-    ;; balances, which is the only honest source. Nothing on-chain consumes it,
-    ;; and the participation tooling reads tables rather than events.
-    ;; This is the ONE exception to the house rule stated above the event block
-    ;; ("every event cap requires the capability that authorized the underlying
-    ;; action"), and the exception is irreducible: fungible-xchain-v1 mandates the
-    ;; capability, and the resume holds no capability to require. A guard inside
-    ;; the body would not help - the cap's own frame would satisfy it.
+    ;; where no capability is held - the continuation's authority IS the SPV
+    ;; proof - so this is the ONE irreducible exception to the house rule above.
+    ;; Every check below is satisfiable by an uninvolved caller, so a third
+    ;; party can fabricate this event from nothing: NEVER read it as evidence
+    ;; of an arrival - reconcile against balances instead.
     (enforce (> amount 0.0) "amount must be positive")
     (enforce (!= receiver "") "receiver must be named")
     (enforce (contains source-chain coin.VALID_CHAIN_IDS) "invalid source chain"))
@@ -617,13 +468,10 @@
   (defun transfer-create:string
       (sender:string receiver:string receiver-guard:guard amount:decimal)
     (with-capability (TRANSFER sender receiver amount)
-      ;; DEBIT IS INLINED, not called. A standalone public `debit` is a BURN
-      ;; path: it lowers a balance without raising another, and the supply row
-      ;; never sees it, so `chain-minted` would over-report issuance forever.
-      ;; Pact has no private functions, so the only way to make the debit
-      ;; unreachable on its own is to not give it a name. Both checks below are
-      ;; load-bearing - `(<= amount b)` alone admits a NEGATIVE amount, and
-      ;; `(- b amount)` would then RAISE the balance.
+      ;; DEBIT IS INLINED, not called: a standalone public `debit` is a BURN
+      ;; path, and Pact has no private functions, so the debit gets no name.
+      ;; Both checks below are load-bearing - `(<= amount b)` alone admits a
+      ;; NEGATIVE amount, and `(- b amount)` would then RAISE the balance.
       (require-capability (DEBIT sender))
       (enforce (> amount 0.0) "debit amount must be positive")
       (enforce-unit amount)
@@ -631,14 +479,11 @@
         (enforce (<= amount sb) "insufficient funds")
         (update accounts sender { "balance": (- sb amount) }))
       (release-votes sender)
-      ;; The receiver credit is INLINED here, lexically fused with the debit above,
-      ;; and is deliberately NOT exposed as a standalone balance-increasing function.
-      ;; Because this path always performs a real, matching debit first (DEBIT enforces
-      ;; the SENDER's own account guard), any caller can only move an account it
-      ;; actually controls => supply is conserved, never minted. The writer is inlined
-      ;; rather than factored into a shared function. Any change here MUST keep every
-      ;; balance increase unreachable except behind a real debit, the MINT keyset, or
-      ;; the cross-chain receive resume.
+      ;; The receiver credit is INLINED, lexically fused with the debit above,
+      ;; and deliberately NOT exposed as a standalone function: the matching
+      ;; debit is what conserves supply. Any change here MUST keep every
+      ;; balance increase unreachable except behind a real debit, the MINT
+      ;; keyset, or the cross-chain receive resume.
       (validate-account receiver)
       (enforce-reserved receiver receiver-guard)
       (with-default-read accounts receiver
@@ -647,40 +492,22 @@
         (enforce (= g receiver-guard) "account guard mismatch")
         (write accounts receiver { "balance": (+ b amount), "guard": g }))))
 
-  ;; NOTE: there is deliberately NO public `debit`, for the same reason there is
-  ;; no public credit: a standalone debit is a BURN, and this token has no burn
-  ;; path by design. The balance DECREASE is inlined into exactly two places -
-  ;; `transfer-create` (fused with the matching credit) and the cross-chain
-  ;; step-0 (fused with the yield that credits on the target chain). Keep it
-  ;; that way: every decrease must be paired with a corresponding increase, or
-  ;; supply silently drifts away from `chain-minted`.
-
-  ;; NOTE: there is deliberately NO public `credit-minted`. A standalone
-  ;; balance-increasing function whose one-shot and exact-supply checks live in
-  ;; its CALLER is a wrapper-trust hole: the function is a public entry point in
-  ;; its own right, and MINT is satisfiable in any transaction carrying the
-  ;; governance signatures - so the checks must not live one level up. The write
-  ;; is INLINED into `init-mint`, behind that function's own one-shot supply-row
-  ;; gate and its exact-TOTAL-SUPPLY check. Do not factor it back out.
+  ;; Deliberately NO public `debit` (a standalone debit is a BURN, and this
+  ;; token has no burn path) and NO public `credit-minted` (checks that live in
+  ;; a caller are a wrapper-trust hole). The decrease is inlined into
+  ;; transfer-create and the cross-chain step-0, each fused with its matching
+  ;; credit; the mint write is inlined into init-mint behind its one-shot gate.
 
   (defun get-balance:decimal (account:string)
     (at 'balance (read accounts account)))
 
   (defun get-balance-default:decimal (account:string)
-    @doc "Balance of an account that MAY NOT EXIST, as 0.0. Read-only.        \
-         \                                                                    \
-         \`get-balance` must keep raising on a missing account - fungible-v2   \
-         \requires it, and callers rely on it - so this is a separate name     \
-         \rather than a relaxation of that one.                               \
-         \                                                                    \
-         \It exists because `pco-claim`'s freeze interlock asks whether the    \
-         \pool still holds tokens, and on 19 of the 20 chains the pool row has \
-         \never been written: the mint happens on the hub only. `read` raises  \
-         \there, so the interlock aborted the freeze deploy on every non-hub   \
-         \chain - refusing a freeze because the pool is EMPTY, which is the    \
-         \opposite of what it is for. `with-default-read` covers a missing ROW \
-         \(it does NOT cover a missing TABLE, which stays an abort, correctly: \
-         \a chain with no `accounts` table is broken, not empty)."
+    @doc "Balance of an account that MAY NOT EXIST, as 0.0; read-only.       \
+         \`get-balance` must keep raising on a missing account (fungible-v2  \
+         \requires it), so this is a separate name for pco-claim's freeze    \
+         \interlock, which must read the never-written pool row as EMPTY on  \
+         \the 19 non-hub chains. A missing ROW reads 0.0; a missing TABLE    \
+         \still aborts, correctly - that chain is broken, not empty."
     (with-default-read accounts account
       { "balance": 0.0 } { "balance" := b } b))
 
@@ -729,27 +556,13 @@
       (with-capability (TRANSFER_XCHAIN sender receiver amount target-chain)
         (validate-account sender)
         (validate-account receiver)
-        ;; CROSS-CHAIN RECEIVERS MUST BE PRINCIPALS. Checked HERE, on the source
-        ;; chain, before anything is debited, because step 1 has NO rollback: a
-        ;; receiver/guard pair that step 1 cannot credit destroys the debited
-        ;; tokens outright, with no burn accounting (chain-minted keeps reporting
-        ;; full supply). Two distinct ways that happens, and this one enforce
-        ;; closes both:
-        ;;   1. A mismatched reserved pair ("k:<hex>" with a different key's
-        ;;      guard) fails enforce-reserved at credit time. That predicate is
-        ;;      pure in (account, guard) and both are frozen into the yield, so
-        ;;      it would fail on every chain, forever.
-        ;;   2. A VANITY (non-principal) name is squattable. Its guard is not
-        ;;      derivable from the name, so ANY observer of the public yield can
-        ;;      create that account on the TARGET chain under their own guard
-        ;;      before the continuation lands; credit then dies on the "account
-        ;;      guard mismatch" check against the row that already exists. That
-        ;;      is a permanent third-party griefing kill on someone else's funds.
-        ;; validate-principal subsumes enforce-reserved here and closes both.
-        ;; It costs nothing real: the pool (m:), the reserve (r:) and every
-        ;; holder account (k:) are principals, and a principal's guard IS its
-        ;; name, so it cannot be squatted. Vanity names remain fully usable for
-        ;; same-chain transfers.
+        ;; CROSS-CHAIN RECEIVERS MUST BE PRINCIPALS, checked on the source
+        ;; chain before anything is debited: step 1 has NO rollback, so a pair
+        ;; the credit step refuses destroys the debited tokens outright. A
+        ;; vanity (non-principal) name is squattable on the target chain - any
+        ;; observer of the public yield can pre-create it under their own guard
+        ;; - while a principal's guard IS its name. Vanity names remain fully
+        ;; usable for same-chain transfers.
         (enforce (validate-principal receiver-guard receiver)
           "cross-chain receiver must be the principal of its guard")
         ;; Inlined debit (there is no standalone one - see transfer-create).
@@ -795,22 +608,12 @@
 
   (defun init-mint:string (recipients:[object{recipient}])
     @doc "One-shot: mint EXACTLY TOTAL-SUPPLY across the recipients, on the  \
-         \hub chain only. One-shot AS A FUNCTION: the supply row is seeded   \
-         \{0.0, 0.0} at deploy and this call requires minted = 0.0, so a     \
-         \second call through this path is impossible.                       \
-         \HONEST LIMIT: that gate binds the                                 \
-         \FUNCTION, not the governance keyset. `minted` is an ordinary table \
-         \row, and while the module is unfrozen the 2-of-3 keyset can        \
-         \acquire module admin, reset the row, and mint again - just as it   \
-         \could simply UPGRADE the module to do anything at all. Fixed       \
-         \supply is therefore a property of governance restraint plus the    \
-         \FROZEN-MODULE flip, NOT a property this function can enforce       \
-         \alone. Upgradeability is disclosed in the README; do not read this \
-         \gate as making the keyset powerless over supply.                   \
-         \Distribute to principal (k:/w:/c:/r:) accounts, or mint in a       \
-         \transaction that guarantees the recipient rows: a pre-created      \
-         \vanity name under a foreign guard aborts the mint (griefing, not   \
-         \theft)."
+         \hub chain only - the supply row requires minted = 0.0, so a second \
+         \call through this path is impossible. That gate binds the FUNCTION, \
+         \not the keyset: while the module is unfrozen module admin can reset \
+         \the row, so fixed supply is enforced only at the FROZEN-MODULE     \
+         \flip. Distribute to principal accounts: a pre-created vanity name  \
+         \under a foreign guard aborts the mint (griefing, not theft)."
     (with-capability (MINT)
       (let ((chain (at 'chain-id (chain-data))))
         (enforce (= chain GOV-CHAIN) "mint happens on the hub chain only"))
@@ -827,10 +630,9 @@
                    (g0:guard (at 'guard r)))
                (enforce (> amt 0.0) "recipient amount must be positive")
                (enforce-unit amt)
-               ;; Inlined credit — see the note where `credit-minted` used to be.
-               ;; The only balance increase behind the MINT keyset, and it is
-               ;; unreachable except through this function's one-shot supply-row
-               ;; gate and the exact-TOTAL-SUPPLY check above.
+               ;; Inlined credit: the only balance increase behind the MINT
+               ;; keyset, unreachable except through this function's one-shot
+               ;; supply-row gate and the exact-TOTAL-SUPPLY check above.
                (validate-account acct)
                (enforce-reserved acct g0)
                (with-default-read accounts acct
@@ -853,16 +655,11 @@
     (with-default-read supply SUPPLY-KEY { "minted": 0.0 } { "minted" := m } m))
 
   ;; -----------------------------
-  ;; Advisory governance (hub chain only)
+  ;; Advisory governance (chain-local: a holder votes where their tokens are)
   ;; -----------------------------
 
   (defun curr-time:time ()
     (at 'block-time (chain-data)))
-
-  (defun enforce-hub:bool ()
-    @doc "Proposals and votes exist only on the hub chain."
-    (enforce (= (at 'chain-id (chain-data)) GOV-CHAIN)
-      "governance lives on the hub chain only"))
 
   (defun reserve-account:string ()
     @doc "The community reserve account name (cannot vote)."
@@ -887,35 +684,22 @@
       r))
 
   (defcap NON-VOTING-ADMIN ()
-    @doc "Register or release an account as outside the float. The community \
-         \keyset, and deliberately NOT gated on FROZEN-MODULE - the register  \
-         \must stay correctable after the code is frozen, because getting it  \
-         \wrong in either direction distorts a published tally.               \
-         \                                                                    \
-         \BE PRECISE ABOUT WHAT THIS GRANTS. It moves no funds. It is not     \
-         \limited to escrows either: there is no on-chain predicate for \"is  \
-         \an escrow\", and a principal-TYPE rule was deliberately rejected    \
-         \(see cast-vote-internal), so the register accepts ANY account name. \
-         \Governance can therefore bar a named, ordinary holder from voting,  \
-         \and that power outlives the freeze by design. What bounds it is     \
-         \disclosure, not code: every entry carries a mandatory public reason \
-         \and emits NON-VOTING-SET, and removal emits NON-VOTING-CLEARED, so  \
-         \the register is auditable from chain history at any time."
+    @doc "Register or release an account as outside the float: the community \
+         \keyset, deliberately NOT gated on FROZEN-MODULE - the register must \
+         \stay correctable after the freeze, because getting it wrong in      \
+         \either direction distorts a published tally. It moves no funds but  \
+         \accepts ANY account name, so governance can bar a named holder;     \
+         \what bounds it is disclosure - every change carries a public reason \
+         \and emits an event, so the register is auditable from chain history."
     (enforce-keyset ADMIN-KS))
 
   (defun register-non-voting:string (account:string reason:string)
-    @doc "Record ACCOUNT as an escrow whose holdings are not part of the      \
-         \float and therefore carry no vote.                                  \
-         \                                                                    \
-         \Called by the module that OWNS the escrow, from its own deploy, so  \
-         \the exclusion lands with the escrow rather than depending on a      \
-         \ceremony step somebody has to remember. That is also how this       \
-         \module learns the claim pool's principal: `pco-claim` depends on    \
-         \`pco`, so `pco` naming it directly would be circular - instead the  \
-         \owner registers itself, in the direction the dependency already     \
-         \runs. Governance may register any other escrow (for example the gas \
-         \station's coin account) at any time.                                \
-         \REASON is mandatory and public: the register is meant to be read."
+    @doc "Record ACCOUNT as an escrow whose holdings are outside the float    \
+         \and carry no vote. Called by the module that OWNS the escrow, from  \
+         \its own deploy, so the exclusion travels with the escrow - that is  \
+         \how `pco` learns the claim pool's principal without naming          \
+         \`pco-claim` (which depends on this module, so naming it here would  \
+         \be circular). REASON is mandatory and public."
     (with-capability (NON-VOTING-ADMIN)
       (validate-account account)
       (enforce (!= "" reason) "a public reason is required")
@@ -924,9 +708,9 @@
       (format "{} registered as non-voting" [account])))
 
   (defun release-non-voting:string (account:string)
-    @doc "Remove an account from the register - the correction path if an     \
-         \account was excluded in error. Distributed holdings must never be   \
-         \silently disenfranchised, so this exists and is evented."
+    @doc "Remove an account from the register - the correction path for an   \
+         \account excluded in error. Evented: distributed holdings must never \
+         \be silently disenfranchised."
     (with-capability (NON-VOTING-ADMIN)
       (with-read non-voting account { "reason" := r }
         (enforce (!= r "") "account is not registered"))
@@ -943,53 +727,35 @@
          \forever. Ops itself can never call this. ONLY a plain keyset      \
          \guard is accepted (principal k: or w:) - see the enforce below."
     (with-capability (OPS-ADMIN)
-      ;; A guard is not introspectable, but its PRINCIPAL is a faithful,
-      ;; total encoding of it - so validate the principal. Three checks,
-      ;; each closing a shape that governance could store by mistake and
-      ;; then have to notice the hard way.
+      ;; A guard is not introspectable, but its PRINCIPAL is a faithful, total
+      ;; encoding of it - so validate the principal. Three checks, each closing
+      ;; a shape governance could store by mistake.
       (let ((p (create-principal g)))
 
-        ;; 1. TYPE. The first two characters are the guard's type tag:
-        ;;      k:/w: literal keyset - inert data, always evaluable   ACCEPT
-        ;;      r:    keyset REFERENCE - an undefined name (typo, or a
-        ;;            keyset never created on THIS chain) makes every
-        ;;            ops call die on a lookup error that enforce-one
-        ;;            cannot catch; and it re-opens the redefinition
-        ;;            hijack this table exists to remove              REJECT
-        ;;      u:    user guard - runs module code at authorization
-        ;;            time; a table read in it is a rug-pull surface   REJECT
-        ;;      c:/p: capability & pact guards - no signer satisfies   REJECT
+        ;; 1. TYPE: only literal keysets (k:/w:) are inert, always-evaluable
+        ;; data. r: re-opens the redefinition hijack this table exists to
+        ;; remove and dies on an undefined name; u: runs module code at
+        ;; authorization time; c:/p: no signer can satisfy.
         (enforce (or (= "k:" (take 2 p)) (= "w:" (take 2 p)))
           (format "ops authority must be a plain keyset guard, not {}" [(take 2 p)]))
 
-        ;; 2. PREDICATE. A `k:` principal is by construction ONE real key
-        ;; under keys-all, so it needs nothing further. A `w:` principal
-        ;; carries its predicate verbatim as the suffix, and a keyset may
-        ;; name a CUSTOM predicate (`ns.module.fn`) - which runs module
-        ;; code at authorization time, exactly the hazard user guards are
-        ;; refused for. Such a predicate can be permanently open (any
-        ;; stranger holds ops) or abort-prone (ops silently frozen).
-        ;; Allow only the three builtins.
-        ;; KNOWN GAP: a principal encodes the key-list
-        ;; HASH, not the key COUNT, so an UNSATISFIABLE keyset - e.g. keys-2
-        ;; over a single key - passes all three checks. Storing one bricks the
-        ;; ops tier. It is not a security hole and it is fully recoverable:
-        ;; governance is tried FIRST in both enforce-one gates, and OPS-ADMIN
-        ;; is governance-only, so governance simply calls this again. Verify
-        ;; the key count off-chain before signing; it cannot be checked here.
+        ;; 2. PREDICATE: a w: principal carries its predicate as the suffix,
+        ;; and a CUSTOM predicate runs module code at authorization time - the
+        ;; same hazard user guards are refused for. Only the three builtins.
+        ;; KNOWN GAP: a principal encodes the key-list HASH, not the count, so
+        ;; an unsatisfiable keyset (e.g. keys-2 over one key) passes; that
+        ;; bricks only the ops tier and governance simply calls this again -
+        ;; verify the key count off-chain before signing.
         (enforce (or (= "k:" (take 2 p))
                  (or (= ":keys-all" (take -9 p))
                  (or (= ":keys-any" (take -9 p))
                      (= ":keys-2"   (take -7 p)))))
           "ops keyset must use a builtin predicate (keys-all, keys-any, keys-2)")
 
-        ;; 3. NON-EMPTY. `keys-all` over ZERO keys is VACUOUSLY TRUE: it
-        ;; would hand the routine tier - create-round, set-open, and the
-        ;; bounded grant path out of the pool - to anyone signing nothing
-        ;; at all. That fails OPEN, so it is strictly worse than any
-        ;; shape above. The key-list hash of an empty keyset is a
-        ;; constant, so every empty keyset shares one principal prefix
-        ;; whatever its predicate; reject all of them.
+        ;; 3. NON-EMPTY: `keys-all` over ZERO keys is VACUOUSLY TRUE - it
+        ;; would hand the routine tier to anyone signing nothing. Every empty
+        ;; keyset shares one principal prefix (the key-list hash is a
+        ;; constant); reject all of them.
         (enforce (!= EMPTY-KEYSET-PREFIX (take 45 p))
           "ops keyset must not be empty")
 
@@ -997,24 +763,74 @@
         (emit-event (OPS-GUARD-SET p))))
     "ops guard set")
 
+  (defun validate-proposal-id:bool (pid:string)
+    @doc "Proposal ids are short ASCII slugs, chosen by the operator so that  \
+         \the same question carries the SAME id on all 20 chains.            \
+         \                                                                    \
+         \THE COLON BAN IS LOAD-BEARING, not neatness. Ballot rows are keyed  \
+         \'<pid>:<account>', and PCO account names may legally contain a      \
+         \colon (every k: account does). Without this, proposal '1' and       \
+         \proposal '1:alice' address overlapping ballot rows and one question \
+         \can read or overwrite the other's votes."
+    (let ((len (length pid)))
+      (enforce (and (>= len 1) (<= len 64)) "proposal id must be 1-64 characters"))
+    (enforce (is-charset CHARSET_ASCII pid) "proposal id must be ASCII")
+    (enforce (not (contains ":" pid)) "proposal id must not contain ':'")
+    true)
+
   (defun open-ids:[string] ()
-    @doc "Currently OPEN proposal ids (pruned view of the active index)."
+    @doc "Ids a ballot may be cast on RIGHT NOW: started, not ended, not      \
+         \cancelled. Also the set `release-votes` walks - deliberately the    \
+         \same horizon. A question that has not started carries no ballots,   \
+         \so releasing against it would be a no-op."
     (let ((now (curr-time)))
       (with-default-read rcv-actives ACTIVE-KEY { "ids": [] } { "ids" := ids }
         (filter (lambda (pid:string)
-                  (< now (at 'close-at (read rcv-proposals pid))))
+                  (with-read rcv-proposals pid
+                    { "starts-at" := sa, "ends-at" := ea, "cancelled" := cx }
+                    (and (not cx) (and (>= now sa) (< now ea)))))
+                ids))))
+
+  (defun live-ids:[string] ()
+    @doc "Ids still OCCUPYING A SLOT: not ended and not cancelled - which     \
+         \includes questions that have not started yet. Distinct from         \
+         \open-ids and it must be: once a question can be authored in advance, \
+         \counting only the VOTABLE ones against MAX-ACTIVE-PROPOSALS would   \
+         \let an unlimited number of pending questions be queued, and each of \
+         \them lands on all 20 chains. The cap is on outstanding questions,   \
+         \not on simultaneously-votable ones."
+    (let ((now (curr-time)))
+      (with-default-read rcv-actives ACTIVE-KEY { "ids": [] } { "ids" := ids }
+        (filter (lambda (pid:string)
+                  (with-read rcv-proposals pid
+                    { "ends-at" := ea, "cancelled" := cx }
+                    (and (not cx) (< now ea))))
                 ids))))
 
   (defun create-proposal:string
-      (title:string body:string options:[string] duration-hours:integer)
+      (pid:string title:string body:string options:[string]
+       created-at:time starts-at:time ends-at:time)
     @doc "Open an ADMIN-AUTHORED ranked-choice question (ops tier; the       \
-         \governance keyset always works too). 2..MAX-OPTIONS distinct named \
-         \options; voters rank them. At most MAX-ACTIVE-PROPOSALS open. The  \
-         \community suggests questions on the public channels - the org      \
-         \makes them official here."
-    (enforce-hub)
-    (enforce (and (>= duration-hours MIN-VOTE-HOURS) (<= duration-hours MAX-VOTE-HOURS))
-      "duration outside [24h, 720h]")
+         \governance keyset always works too): 2..MAX-OPTIONS distinct named \
+         \options, at most MAX-ACTIVE-PROPOSALS outstanding. Runs on every   \
+         \chain - the same question is published to all 20 with IDENTICAL    \
+         \arguments, which is why the id and all three instants are supplied \
+         \rather than derived: a deadline computed from local block time     \
+         \gives 20 different deadlines, which is a double-vote hole."
+    (validate-proposal-id pid)
+    (let ((now (curr-time)))
+      ;; created-at is caller-supplied so that all 20 chains compute the same
+      ;; announce floor. Bounded both ways so it cannot be fabricated forward
+      ;; nor backdated to dodge the floor.
+      (enforce (<= (abs (diff-time created-at now)) (dec CREATED-SKEW-SECONDS))
+        "created-at is too far from this chain's clock"))
+    (enforce (>= (diff-time starts-at created-at) (dec (* MIN-ANNOUNCE-HOURS 3600)))
+      "voting must open at least 12h after the question is authored")
+    (enforce (> ends-at starts-at) "voting must close after it opens")
+    (enforce (>= (diff-time ends-at starts-at) (dec (* MIN-VOTE-HOURS 3600)))
+      "voting must run at least 24h")
+    (enforce (<= (diff-time ends-at starts-at) (dec (* MAX-VOTE-HOURS 3600)))
+      "a question may not run longer than 30 days")
     (enforce (and (> (length title) 0) (<= (length title) 120)) "title 1..120 chars")
     (enforce (<= (length body) 2000) "body <= 2000 chars")
     (let ((k (length options)))
@@ -1026,27 +842,24 @@
                "each option 1..60 chars"))
            options))
     (with-capability (PROPOSAL-OPS)
-      (let* ((open (open-ids))
-             (n (with-default-read gov-counts COUNT-KEY { "n": 0 } { "n" := c } c))
-             (pid (int-to-str 10 (+ n 1)))
-             (now (curr-time))
-             (close (add-time now (hours duration-hours))))
-        (enforce (< (length open) MAX-ACTIVE-PROPOSALS) "too many active proposals")
-        (write gov-counts COUNT-KEY { "n": (+ n 1) })
+      (let ((live (live-ids)))
+        ;; The cap counts OUTSTANDING questions, not simultaneously-votable ones
+        ;; - see live-ids. `insert` is what makes the id one-shot: a second
+        ;; create under the same id aborts rather than overwriting a live tally.
+        (enforce (< (length live) MAX-ACTIVE-PROPOSALS) "too many active proposals")
         (insert rcv-proposals pid
           { "title": title, "body": body, "options": options
-          , "created": now, "close-at": close
+          , "created": created-at, "starts-at": starts-at, "ends-at": ends-at
+          , "cancelled": false
           , "scores": (map (lambda (o:string) 0.0) options)
           , "turnout": 0.0 })
-        ;; the authoritative pairwise record, K x K zeros. Created HERE so that
-        ;; every proposal opened under this module has a complete record from
-        ;; its first ballot; a question opened before this existed has no row and
-        ;; get-head-to-head says so rather than showing a partial matrix.
+        ;; The authoritative pairwise record, K x K zeros, created HERE so
+        ;; every proposal has a complete record from its first ballot.
         (insert rcv-margins pid
           { "m": (map (lambda (_i:integer) 0.0)
                       (enumerate 0 (- (* (length options) (length options)) 1))) })
-        (write rcv-actives ACTIVE-KEY { "ids": (+ open [pid]) })
-        (emit-event (GOV-PROPOSED pid title options close))
+        (write rcv-actives ACTIVE-KEY { "ids": (+ live [pid]) })
+        (emit-event (GOV-PROPOSED pid title options starts-at ends-at))
         pid)))
 
   (defun admin-cancel-proposal:string (pid:string reason:string)
@@ -1057,9 +870,16 @@
       "a public reason is required (1..2000 chars)")
     (with-capability (PROPOSAL-OPS)
       (let ((now (curr-time)))
-        (with-read rcv-proposals pid { "close-at" := ca }
-          (enforce (< now ca) "proposal already closed")
-          (update rcv-proposals pid { "close-at": now }))
+        (with-read rcv-proposals pid { "starts-at" := sa, "cancelled" := cx }
+          ;; ONLY BEFORE VOTING OPENS: unbounded cancellation across 20 chains
+          ;; is a selective veto - tallies are readable throughout, so an
+          ;; operator could void the chains going the wrong way. Before the
+          ;; start no ballot exists anywhere.
+          (enforce (not cx) "proposal is already cancelled")
+          (enforce (< now sa) "voting has already opened - a question cannot be cancelled once it is running"))
+        ;; Recorded as a FLAG, not by moving a deadline, so a voided copy reads
+        ;; back distinct from a normally-closed one and is never summed.
+        (update rcv-proposals pid { "cancelled": true })
         (emit-event (GOV-CANCELLED pid reason))))
     "cancelled")
 
@@ -1076,18 +896,12 @@
   (defun borda-apply:[decimal]
       (scores:[decimal] options:[string] ranking:[integer] delta:decimal)
     @doc "SCORES with DELTA-weighted Borda points of RANKING applied: an     \
-         \option ranked at position p (0-based) gains delta*(K-p) points     \
-         \(first of K options = K points); unranked options are untouched.   \
-         \Negative delta removes a prior contribution exactly.               \
-         \                                                                   \
-         \THIS IS NOT THE RESULT. These scores are retained and published as \
-         \a TRUNCATION DIAGNOSTIC, not as the verdict: under this formula a  \
-         \length-1 ballot gives its favourite a margin of delta*K over the   \
-         \strongest rival while a full ranking gives delta*1, so truncating  \
-         \is strictly dominant and the total moves 2x-3x on identical        \
-         \preferences. Compare the score total against turnout*K*(K+1)/2 to  \
-         \read how complete the ballots were. The authoritative result is    \
-         \the head-to-head matrix (see rcv-margin and get-head-to-head)."
+         \option ranked at position p (0-based) gains delta*(K-p) points;    \
+         \unranked options are untouched, and negative delta removes a prior \
+         \contribution exactly. THIS IS NOT THE RESULT - Borda scores reward \
+         \ballot truncation, so they are published as a truncation           \
+         \DIAGNOSTIC only; the authoritative result is the head-to-head      \
+         \matrix (see rcv-margin and get-head-to-head)."
     (let ((k (length options)))
       (map (lambda (i:integer)
              (let ((p (rank-pos ranking i)))
@@ -1138,45 +952,40 @@
       (if (> new-w 0.0) (margins-apply cleared k new-r new-w) cleared)))
 
   (defun cast-vote:string (pid:string account:string ranking:[integer])
-    @doc "Rank the proposal's options (ordered option indices, best first;   \
-         \a partial ranking is allowed - unranked options score nothing).    \
-         \Weight = CURRENT hub-chain balance; re-voting replaces the ballot  \
-         \in place. Authorized by the account's main guard OR its registered \
-         \vote key. The community reserve is barred."
+    @doc "Rank the options (ordered indices, best first; partial rankings    \
+         \allowed). Weight is the caller's balance on THIS chain at the      \
+         \moment of voting; re-voting replaces the ballot; the reserve and   \
+         \registered escrows are barred."
     (with-capability (VOTE pid account)
       (cast-vote-internal pid account ranking)))
 
   (defun cast-vote-internal:string (pid:string account:string ranking:[integer])
-    @doc "The ballot write. EVERY precondition is enforced HERE, behind the VOTE  \
-         \capability - never only in the cast-vote wrapper. Pact has no private   \
-         \functions, so this function is publicly callable; a caller that holds    \
-         \VOTE for an account it controls must still pass every check. If the hub / \
-         \close-time / ranking checks lived only in the wrapper, such a caller could \
-         \deface the published scores with an oversized ranking or mutate the       \
-         \authoritative result after the proposal closed. A public function must    \
-         \never trust its wrapper - all invariants are re-asserted here."
+    @doc "The ballot write. EVERY precondition is enforced HERE, behind the  \
+         \VOTE capability - never only in the cast-vote wrapper: Pact has no \
+         \private functions, so this is publicly callable, and a public      \
+         \function must never trust its wrapper."
     (require-capability (VOTE pid account))
-    (enforce-hub)
     (enforce (!= account RESERVE-ACCOUNT) "the community reserve cannot vote")
-    ;; Escrows that are NOT part of the float do not vote. This is an explicit
-    ;; register of named accounts, not a rule about account TYPES: what
-    ;; disqualifies the claim pool is that it holds undistributed community
-    ;; tokens, not that it happens to be module-guarded. A type rule would also
-    ;; disenfranchise participants who legitimately hold through a contract, and
-    ;; would still miss an escrow held under an ordinary (non-principal) name.
-    ;; Entries are registered by the module that OWNS the escrow, at its own
-    ;; deploy - see register-non-voting - which is how `pco` learns the claim
-    ;; pool's principal without referencing `pco-claim` (that module depends on
-    ;; this one, so naming it here would be circular).
-    ;; Like the reserve bar this is a NAME check, not a lock on governance: while
-    ;; this module is unfrozen the keyset can move escrowed tokens into an
-    ;; ordinary account and vote them. That route emits a public TRANSFER event;
-    ;; module admin can also write scores directly, emitting nothing.
-    (enforce (not (non-voting? account))
-      "this account is registered as non-voting (an escrow outside the float)")
+    ;; Registered escrows do not vote: an explicit register of NAMES, not a
+    ;; rule about account types (see non-voting-row). A name check, not a lock
+    ;; on governance - the keyset can move escrowed tokens to an ordinary
+    ;; account and vote them, publicly evented.
+    ;; `barred` is LET-BOUND before its enforce, never read inside the
+    ;; condition: a table read inside an enforce condition is
+    ;; lineage-dependent (accepted on KDA-CE nodes, rejected on upstream
+    ;; lineages, invisible to the REPL).
+    (let ((barred (non-voting? account)))
+      (enforce (not barred)
+        "this account is registered as non-voting (an escrow outside the float)"))
     (with-read rcv-proposals pid
-      { "close-at" := close, "options" := opts, "scores" := ss, "turnout" := tn }
-      (enforce (< (curr-time) close) "voting closed")
+      { "starts-at" := sa, "ends-at" := ea, "cancelled" := cx
+      , "options" := opts, "scores" := ss, "turnout" := tn }
+      ;; The window is [starts-at, ends-at) against THIS chain's block time;
+      ;; both instants are absolute and identical on all 20 chains, so every
+      ;; copy opens and closes together up to the chains' own clock spread.
+      (enforce (not cx) "this question was cancelled")
+      (enforce (>= (curr-time) sa) "voting has not opened yet")
+      (enforce (< (curr-time) ea) "voting closed")
       (let ((k (length opts))
             (r (length ranking)))
         (enforce (and (>= r 1) (<= r k)) "ranking: 1..K entries")
@@ -1196,12 +1005,10 @@
                  (applied (borda-apply cleared opts ranking weight)))
             (update rcv-proposals pid
               { "scores": applied, "turnout": (+ (- tn old-w) weight) })
-            ;; the authoritative aggregate: swap this ballot's pairwise
-            ;; contribution the same way, from the same two (ranking, weight)
-            ;; pairs, so the two records can never drift apart. INLINED (no
-            ;; standalone tally writer — this call already holds real
-            ;; VOTE and derives every value from state; k = real option count).
-            ;; A pre-tally proposal has no margin row: no-op on purpose (F2).
+            ;; The authoritative aggregate: swap this ballot's pairwise
+            ;; contribution from the same (ranking, weight) pairs, so the two
+            ;; records can never drift apart. INLINED - no standalone tally
+            ;; writer. A proposal without a margin row is a no-op on purpose.
             (let ((k (length opts)))
               (with-default-read rcv-margins pid { "m": [] } { "m" := mm }
                 (if (> (length mm) 0)
@@ -1231,11 +1038,9 @@
                        (update rcv-proposals pid
                          { "scores": (borda-apply ss opts r (- excess))
                          , "turnout": (- tn excess) })
-                       ;; shrink the pairwise record by the same excess: pass an
-                       ;; EMPTY new ranking, so this removes and adds nothing back.
-                       ;; INLINED (no standalone tally writer); everything
-                       ;; is derived from real state, so a public call can only
-                       ;; correct stale weights, never forge. k = real option count.
+                       ;; Shrink the pairwise record by the same excess: an
+                       ;; EMPTY new ranking removes and adds nothing back.
+                       ;; INLINED - no standalone tally writer.
                        (let ((k (length opts)))
                          (with-default-read rcv-margins pid { "m": [] } { "m" := mm }
                            (if (> (length mm) 0)
@@ -1260,10 +1065,16 @@
          \authoritative outcome call get-head-to-head. ADVISORY either way:   \
          \no quorum, nothing executes."
     (with-read rcv-proposals pid
-      { "title" := t, "close-at" := ca, "options" := o
-      , "scores" := s, "turnout" := tn }
+      { "title" := t, "starts-at" := sa, "ends-at" := ea, "cancelled" := cx
+      , "options" := o, "scores" := s, "turnout" := tn }
       { "title": t, "options": o, "scores": s, "turnout": tn
-      , "close-at": ca, "closed": (>= (curr-time) ca) }))
+      , "starts-at": sa, "ends-at": ea, "cancelled": cx
+      ;; `closed` means "no longer taking votes", which a cancelled question is
+      ;; too. `cancelled` is reported SEPARATELY and must never be folded into
+      ;; it: a combining program has to be able to tell a question that ran and
+      ;; ended from one that was voided, because the second must never be summed.
+      , "closed": (or cx (>= (curr-time) ea))
+      , "started": (>= (curr-time) sa) }))
 
   (defun h2h-wins:[decimal] (m:[decimal] k:integer)
     @doc "Copeland win-count per option: how many of the other K-1 options it \
@@ -1293,12 +1104,14 @@
          \a real possible outcome that should be reported as one rather than   \
          \broken by an arbitrary rule."
     (with-read rcv-proposals pid
-      { "title" := t, "close-at" := ca, "options" := o, "turnout" := tn }
+      { "title" := t, "starts-at" := sa, "ends-at" := ea, "cancelled" := cx
+      , "options" := o, "turnout" := tn }
       (let ((k (length o)))
         (with-default-read rcv-margins pid { "m": [] } { "m" := m }
           (if (= 0 (length m))
               { "title": t, "options": o, "turnout": tn
-              , "close-at": ca, "closed": (>= (curr-time) ca)
+              , "starts-at": sa, "ends-at": ea, "cancelled": cx
+              , "closed": (or cx (>= (curr-time) ea))
               , "available": false, "pairs": [], "wins": [], "condorcet": "" }
               (let* ((wins (h2h-wins m k))
                      (top (- (dec k) 1.0))
@@ -1306,23 +1119,21 @@
                                  (if (= (at i wins) top) (at i o) acc))
                                "" (enumerate 0 (- k 1)))))
                 { "title": t, "options": o, "turnout": tn
-                , "close-at": ca, "closed": (>= (curr-time) ca)
+                , "starts-at": sa, "ends-at": ea, "cancelled": cx
+              , "closed": (or cx (>= (curr-time) ea))
                 , "available": true, "pairs": m, "wins": wins
                 , "condorcet": cw }))))))
 
   ;; ---- dedicated voting key (hot key votes; the main key stays cold) ----
 
   (defun set-vote-key:string (account:string guard:guard)
-    @doc "Register/replace the account's dedicated voting guard. MAIN account \
-         \guard only (via VOTE-KEY-ADMIN — scope your signature to it): the   \
-         \hot key can never re-point itself. The vote key can ONLY vote —     \
-         \transfers, rotation, and this registration stay with the main       \
-         \guard. Use a PLAIN keyset for the vote key: a user guard whose      \
-         \predicate reads module tables can fail at vote time, and a          \
-         \keyset-ref to an UNDEFINED keyset aborts the whole vote (the main   \
-         \guard still votes either way — re-register to recover). Rotating    \
-         \the account guard deactivates any registered vote key.              \
-         \Meaningful on the hub chain, where all voting lives."
+    @doc "Register/replace the account's dedicated voting guard: MAIN account \
+         \guard only (via VOTE-KEY-ADMIN), so the hot key can never re-point  \
+         \itself, and the vote key can ONLY vote. Use a PLAIN keyset (a user  \
+         \guard or undefined keyset-ref can abort the vote); rotating the     \
+         \account guard deactivates any registered vote key. Register it on   \
+         \EVERY chain you intend to vote from - module tables are chain-local \
+         \- though an unregistered chain still votes with the main guard."
     (let ((vk (create-principal guard)))
       (with-capability (VOTE-KEY-ADMIN account vk)
         (write vote-delegates account { "guard": guard, "active": true })
@@ -1349,23 +1160,15 @@
 
 ;; Deploy footer — two modes via tx data:
 ;;   upgrade:false  FRESH deploy: create tables + seed the per-chain supply row.
-;;   upgrade:true   upgrade: touch nothing (create-table re-runs abort upgrades).
-;;                  Adding NEW tables to an already-deployed chain is a
-;;                  separate one-off admin tx PER TABLE, for ALL SEVEN of:
-;;                    vote-delegates, rcv-proposals, rcv-ballots, rcv-actives,
-;;                    ops-auth, rcv-margins, non-voting
+;;   upgrade:true   touch nothing (create-table re-runs abort upgrades). A NEW
+;;                  table on an already-deployed chain is a separate one-off
+;;                  admin tx per table:
 ;;                  ((acquire-module-admin <ns>.pco) (create-table <ns>.pco.<t>))
-;;                  (pco-gas-station has an eighth, station-info, of its own.)
-;;                  non-voting was missing from this list: EVERY cast-vote reads
-;;                  it, and it cannot be created after the flip.
-;;                  A chain missing rcv-actives BRICKS every debit (the release
-;;                  path reads it) - INCLUDING pco-claim.sweep-pool, the
-;;                  documented recovery path, while pool-balance still reports a
-;;                  healthy pool because it only reads `accounts`. Verify table
-;;                  existence on all 20 chains BEFORE ever flipping
-;;                  FROZEN-MODULE: after the flip, module admin is unobtainable
-;;                  forever, so create-table is impossible and every exit from
-;;                  the pool is a debit. There is no on-chain recovery.
+;; A chain missing rcv-actives BRICKS every debit (the release path reads it),
+;; INCLUDING pco-claim.sweep-pool, while pool-balance still reports a healthy
+;; pool. Verify every table exists on all 20 chains BEFORE flipping
+;; FROZEN-MODULE: after the flip create-table is impossible forever and there
+;; is no on-chain recovery.
 (if (read-msg 'upgrade)
   [ "upgrade" ]
   [ (create-table accounts)

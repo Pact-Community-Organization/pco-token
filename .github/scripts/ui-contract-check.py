@@ -26,7 +26,9 @@ Borda scores is not caught here. Arguments that are template substitutions
 (`${x}`) are unknown at scan time and are checked for count only.
 
 Usage: ui-contract-check.py [--contracts DIR] [PATH ...]
-Exit 0 = every call resolves. Exit 1 = at least one mismatch.
+Exit 0 = every call resolves. Exit 1 = a mismatch, OR nothing was examined —
+a run that checked zero calls reports FAIL, because a gate that looked at
+nothing must never be reported as one that found nothing wrong.
 """
 
 import re
@@ -37,7 +39,8 @@ from pathlib import Path
 # Pact side: what actually exists
 # --------------------------------------------------------------------------
 
-DEF_RE = re.compile(r'\((defun|defcap|defpact)\s+([A-Za-z0-9_:!?<>=+*/-]+)')
+DEF_RE = re.compile(
+    r'\((defun|defcap|defpact|defconst)\s+([A-Za-z0-9_:!?<>=+*/-]+)')
 
 
 def split_group(src: str, start: int) -> tuple[str, int]:
@@ -137,10 +140,21 @@ def parse_contracts(cdir: Path) -> dict[str, dict]:
         if not m:
             continue
         mod = modules.setdefault(
-            m.group(1), {'defuns': {}, 'defcaps': {}, 'file': path.name})
+            m.group(1),
+            {'defuns': {}, 'defcaps': {}, 'defconsts': set(), 'file': path.name})
         for d in DEF_RE.finditer(src):
             kind, raw = d.group(1), d.group(2)
             name = raw.split(':')[0]
+            # A defconst has NO argument list, so the arg-list logic below would
+            # grab whatever group came next and mis-parse it. Record the name
+            # only. It is recorded at all because the capability scan below fires
+            # on any UPPERCASE member reference, and a constant read straight off
+            # a module (`${G}.EPOCH-CAP`) is not a capability that is missing -
+            # it is a constant that exists. Without this, reading a contract
+            # constant from a tool reports a false MISMATCH.
+            if kind == 'defconst':
+                mod['defconsts'].add(name)
+                continue
             j = src.find('(', d.end())
             if j == -1:
                 continue
@@ -248,12 +262,22 @@ def line_of(src: str, idx: int) -> int:
     return src.count('\n', 0, idx) + 1
 
 
-def check_file(path: Path, modules: dict) -> list[str]:
+def check_file(path: Path, modules: dict,
+               prefixes: dict[str, str]) -> tuple[list[str], int]:
+    """Return (mismatches, contract call sites actually checked).
+
+    PREFIXES ARE RESOLVED ACROSS THE WHOLE SCAN, NOT PER FILE. They used to be
+    read out of the file being checked, which made every ES-module UI invisible
+    - including the canonical one. The website declares T/C/G in src/lib/chain.ts,
+    which makes no calls, and makes all of its contract calls from src/lib/pco.ts,
+    which declares none. So this function returned [] on the one file holding the
+    calls, while main() counted the file WITHOUT them as 'scanned'. Pointed
+    straight at the live UI, the run printed "1 UI file(s) with contract calls /
+    RESULT: PASS" having examined not a single call.
+    """
     src = path.read_text()
-    prefixes = {m.group(1): m.group(2) for m in PREFIX_RE.finditer(src)}
-    if not prefixes:
-        return []
     bad: list[str] = []
+    checked = 0
 
     for var, mod in prefixes.items():
         api = modules.get(mod)
@@ -265,6 +289,7 @@ def check_file(path: Path, modules: dict) -> list[str]:
             if not fm:
                 continue
             fn = fm.group(0)
+            checked += 1
             here = f'{path}:{line_of(src, m.start())}'
             if api is None:
                 bad.append(f'{here}: no contract for module `{mod}`')
@@ -306,6 +331,9 @@ def check_file(path: Path, modules: dict) -> list[str]:
             if api is None:
                 bad.append(f'{here}: no contract for module `{mod}`')
                 continue
+            if cap in api['defconsts']:
+                continue           # a constant read, not a capability use
+            checked += 1
             if cap not in api['defcaps']:
                 bad.append(
                     f'{here}: `{mod}.{cap}` is not a defcap in {api["file"]}')
@@ -321,7 +349,7 @@ def check_file(path: Path, modules: dict) -> list[str]:
                     f'{here}: `{mod}.{cap}` takes '
                     f'{len(api["defcaps"][cap])} argument(s), '
                     f'the signed cap lists {n}')
-    return bad
+    return bad, checked
 
 
 def split_js_list(inner: str) -> list[str]:
@@ -383,22 +411,41 @@ def main() -> int:
                 files += [p for p in sorted(r.rglob(ext))
                           if 'node_modules' not in p.parts]
 
-    problems, scanned = [], 0
+    # One prefix map for the whole scan. An ES-module UI declares `const T =
+    # `${ns}.pco`` in one file and calls `(${T}.get-balance …)` from another;
+    # resolving per file made the calling file unreadable to this gate.
+    prefixes: dict[str, str] = {}
     for f in files:
-        found = check_file(f, modules)
-        if found or PREFIX_RE.search(f.read_text()):
+        for m in PREFIX_RE.finditer(f.read_text()):
+            prefixes[m.group(1)] = m.group(2)
+
+    problems, scanned, calls = [], 0, 0
+    for f in files:
+        found, n = check_file(f, modules, prefixes)
+        if n:
             scanned += 1
+        calls += n
         problems += found
 
     print(f'-- ui-contract-check: {len(modules)} module(s) '
-          f'({", ".join(sorted(modules))}), {scanned} UI file(s) with '
-          f'contract calls --')
+          f'({", ".join(sorted(modules))}), {calls} contract call(s) '
+          f'in {scanned} UI file(s) under {", ".join(str(r) for r in roots)} --')
     for p in problems:
         print(f'MISMATCH: {p}')
     if problems:
         print(f'\nRESULT: FAIL ({len(problems)} mismatch(es))')
         return 1
-    print('RESULT: PASS (every call resolves to a real defun/defcap)')
+    # A gate that examined nothing must never report PASS. Counting FILES is not
+    # enough: pointed at the live UI this used to count the file that declares
+    # the prefixes and makes no calls, so "1 file scanned" and "0 calls checked"
+    # looked identical from here. Count the calls.
+    if calls == 0:
+        print(f'\nRESULT: FAIL (no contract calls found under '
+              f'{", ".join(str(r) for r in roots)} - nothing was verified, so '
+              f'this cannot pass. Check the path, or that the UI still builds '
+              f'its module prefixes with `const X = `${{ns}}.module``.)')
+        return 1
+    print(f'RESULT: PASS ({calls} call(s) resolve to a real defun/defcap)')
     return 0
 
 

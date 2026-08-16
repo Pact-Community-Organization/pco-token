@@ -159,24 +159,41 @@
 (env-sigs [ { "key": "whale-key", "caps": [] } ])
 (expect-failure "holders suggest on the public channels; the org proposes"
   "governance or ops authority required"
-  (free.pco.create-proposal "t" "b" ["a" "b"] 72))
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-08T12:00:00Z")))
 (rollback-tx)
 
-(begin-tx "governance is hub-chain only")
-(env-chain-data { "chain-id": "3" })
+;; INVERTED 2026-08-14 (the chain-local voting design C2). This block used to assert
+;; "no proposals off the hub", which was the defect, not the spec: PCO shipped
+;; hub-only governance against a vote-on-all-chains vision and every test
+;; encoded that belief, so the suite stayed green over it. The same question is
+;; now published to all 20 chains as 20 identical transactions, so creating one
+;; off the hub is REQUIRED to work.
+(begin-tx "a question can be published to a chain other than the hub")
+(env-chain-data { "chain-id": "3", "block-time": (time "2026-08-01T00:00:00Z") })
 (env-keys ["ledger-a"])
-(expect-failure "no proposals off the hub" "hub chain only"
-  (free.pco.create-proposal "off-hub" "body" ["a" "b"] 72))
+(expect "the same question publishes off-hub" "off-hub"
+  (free.pco.create-proposal "off-hub" "off-hub" "body" ["a" "b"]
+    (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-08T12:00:00Z")))
 (rollback-tx)
-(env-chain-data { "chain-id": "0" })
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
 
 (begin-tx "proposal opens under the OPS key alone (routine tier)")
 (env-keys ["ledger-a"])
 (expect "pid 1" "1" (free.pco.create-proposal
+  "1"
   "Which template family should the catalog grow next?"
   "Advisory: rank the options."
-  ["catalog-v2" "docs" "oracles"] 168))
+  ["catalog-v2" "docs" "oracles"]
+  (time "2026-08-01T00:00:00Z")      ; authored now
+  (time "2026-08-01T12:00:00Z")      ; opens 12h later - the announce floor
+  (time "2026-08-08T12:00:00Z")))    ; runs a week
 (commit-tx)
+
+;; Voting cannot begin until starts-at. Every suite that votes must now advance
+;; the clock past the announce window first - that window is the whole point of
+;; C8, not an inconvenience.
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })
 
 (begin-tx "reserve cannot vote")
 (env-keys ["ledger-a", "ledger-b"])

@@ -210,6 +210,32 @@ console.log('ceremony tooling checks\n');
   check('every supplied hash is blessed',
     multi.source.includes(`(bless "${H}")`) && multi.source.includes(`(bless "${H2}")`));
 
+  // Since the cross-chain voting upgrade the source ships with a permanent bless of
+  // the hash it replaced, and every upgrade appends another. The freeze must carry ALL of them
+  // through: each records a hash something may still pin — a dependent mid two-step
+  // upgrade, or an in-flight transfer-crosschain whose step 1 has no rollback — and
+  // the freeze is the one deploy after which nothing can be repaired.
+  //
+  // Read the expected set FROM the contract rather than hardcoding it, so the check
+  // keeps testing the invariant after the next upgrade appends a hash instead of
+  // quietly testing a stale literal.
+  const inSource = [...pco.matchAll(/\(bless\s+"([^"]*)"\s*\)/g)].map((m) => m[1]);
+  check('the contract carries at least one bless to preserve', inSource.length > 0,
+    inSource.length ? `${inSource.length} in source` : 'none found — the permanent bless may have been reverted');
+  const kept = freezeSource(pco, H);
+  check('the freeze preserves every bless already in the source',
+    inSource.every((h) => kept.source.includes(`(bless "${h}")`)),
+    inSource.filter((h) => !kept.source.includes(`(bless "${h}")`)).join(',') || '');
+  check('the freeze reports the union of existing and supplied hashes',
+    [...inSource, H].every((h) => kept.blessed.includes(h)) &&
+    kept.blessed.length === new Set([...inSource, H]).size);
+
+  // Supplying a hash the source already blesses must not emit it twice: a duplicate
+  // (bless ...) is a load-time error, discovered after three hardware signatures.
+  const dup = freezeSource(pco, inSource[0]);
+  check('re-supplying an already-blessed hash does not duplicate it',
+    dup.source.split(`(bless "${inSource[0]}")`).length === 2);
+
   // Re-freezing an already-frozen source needs a human decision about which
   // hashes stay blessed; it must never happen silently.
   let twice = false;
@@ -337,6 +363,145 @@ console.log('ceremony tooling checks\n');
   }
 }
 
+// --------------------------------- create-proposal: 20 chains, identical or not at all
+// A question is 20 separate transactions and the ONLY thing that makes them one
+// question is that their arguments are byte-identical. Everything here is
+// asserted by RUNNING the builder, because a grep would pass on a guard that had
+// been moved below the point where the transactions are built.
+//
+// Every bound is checked at BUILD time rather than left to the contract: this is
+// an ops-tier step, so a question the chain rejects costs 20 device approvals
+// before anyone finds out.
+{
+  const outBefore = snapshotOut();
+  const cfgPath = new URL('../mainnet-config.json', import.meta.url);
+  const had = existsSync(cfgPath);
+  const prior = had ? readFileSync(cfgPath, 'utf8') : null;
+  if (!had) {
+    writeFileSync(cfgPath, JSON.stringify({
+      ns: 'user', deviceA: 'a'.repeat(64), deviceB: 'b'.repeat(64), deviceC: 'c'.repeat(64),
+      gasPayer: { account: 'sender00', publicKey: 'd'.repeat(64) }, totalSupply: 1000000.0,
+    }, null, 2));
+  }
+  // Far enough out that the 12h announce floor is met from a created-at of "now".
+  const soon = new Date(Date.now() + 40 * 3600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const later = new Date(Date.now() + 240 * 3600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const base = {
+    PCO_PID: 'q-test', PCO_TITLE: 'Which first?', PCO_OPTIONS: 'Alpha|Beta|Gamma',
+    PCO_STARTS: soon, PCO_ENDS: later,
+  };
+  const build = (over: Record<string, string> = {}) => {
+    try {
+      const out = execFileSync('npx', ['tsx', 'src/build-tx.ts', 'create-proposal'], {
+        cwd: new URL('..', import.meta.url).pathname, stdio: 'pipe',
+        env: { ...process.env, ...base, ...over,
+               PCO_NETWORK: 'mainnet01', PCO_HOST: 'https://api.chainweb-community.org' },
+      });
+      return { aborted: false, out: String(out) };
+    } catch (e: any) {
+      return { aborted: true, out: String(e.stdout ?? '') + String(e.stderr ?? '') };
+    }
+  };
+  try {
+    const good = build();
+    check('build-tx HAS a create-proposal step at all', !/unknown step/i.test(good.out), good.out.slice(0, 120));
+    check('a well-formed question BUILDS', !good.aborted, good.out.slice(0, 200));
+    check('...emitting one transaction per chain (20)',
+      (good.out.match(/60-create-proposal-q-test-c\d+\.json/g) ?? []).length === 20,
+      String((good.out.match(/60-create-proposal-q-test-c\d+\.json/g) ?? []).length));
+
+    // THE PROPERTY. Read the emitted files and compare their code fields: the
+    // 20 must differ ONLY in chainId. Checked against the artifacts rather than
+    // against the builder's own claim about them.
+    const dir = new URL(`../out/mainnet01/`, import.meta.url);
+    const codes = new Set<string>(); const chainIds = new Set<string>();
+    for (let c = 0; c < 20; c++) {
+      const f = new URL(`60-create-proposal-q-test-c${c}.json`, dir);
+      if (!existsSync(f)) continue;
+      const cmd = JSON.parse(JSON.parse(readFileSync(f, 'utf8')).cmd);
+      codes.add(cmd.payload.exec.code);
+      chainIds.add(cmd.meta.chainId);
+    }
+    check('the 20 transactions carry BYTE-IDENTICAL code', codes.size === 1, `${codes.size} variants`);
+    check('...and differ in chainId, so they are 20 chains and not 20 copies of one',
+      chainIds.size === 20, `${chainIds.size} distinct chainIds`);
+
+    // Bounds, each refused at build time. These mirror the contract's enforces;
+    // if the contract's bound changed and this did not, the mismatch shows up as
+    // a question that builds and then aborts on all 20 chains.
+    check('REFUSES a starts-at inside the 12h announce floor',
+      build({ PCO_STARTS: new Date(Date.now() + 3 * 3600_000).toISOString() }).aborted);
+    check('REFUSES ends-at before starts-at', build({ PCO_ENDS: soon, PCO_STARTS: later }).aborted);
+    check('REFUSES a span longer than a year',
+      build({ PCO_ENDS: new Date(Date.now() + 400 * 24 * 3600_000).toISOString() }).aborted);
+    check('REFUSES fewer than 2 options', build({ PCO_OPTIONS: 'OnlyOne' }).aborted);
+    check('REFUSES more than 5 options', build({ PCO_OPTIONS: 'a|b|c|d|e|f' }).aborted);
+    check('REFUSES duplicate options', build({ PCO_OPTIONS: 'Alpha|Alpha' }).aborted);
+    check('REFUSES a proposal id containing a colon (ballot keys are <pid>:<account>)',
+      build({ PCO_PID: 'q:1' }).aborted);
+    check('REFUSES a title over 120 chars', build({ PCO_TITLE: 'x'.repeat(121) }).aborted);
+    // Quotes are REFUSED, never silently substituted: this text is interpolated
+    // into Pact source AND published verbatim as the question people read.
+    const q = build({ PCO_TITLE: 'Which "first"?' });
+    check('REFUSES a quote in the title instead of rewriting it', q.aborted && /double quote/.test(q.out),
+      q.out.slice(0, 120));
+    // The skew is bounded BOTH ways by the contract. The forward direction used
+    // to be unreachable: the check computed `3600 - (now - tc)`, which for a
+    // future created-at only grows.
+    const isoZ = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    check('REFUSES a created-at older than the 1h skew',
+      build({ PCO_CREATED: isoZ(Date.now() - 2 * 3600_000) }).aborted);
+    const future = build({ PCO_CREATED: isoZ(Date.now() + 3 * 3600_000), PCO_STARTS: isoZ(Date.now() + 40 * 3600_000) });
+    check('...and one in the FUTURE, which the one-sided check could never catch',
+      future.aborted && /FUTURE/.test(future.out), future.out.slice(0, 140));
+
+    // Pact's (time "...") takes %Y-%m-%dT%H:%M:%SZ and nothing else, while
+    // Date.parse takes far more. Each of these satisfies Date.parse and fails on
+    // all 20 chains; the offset form is the worst, because Date.parse converts it
+    // and the 12h floor is then checked against a different instant than the one
+    // written into the transaction.
+    for (const [label, t] of [
+      ['milliseconds', '2027-01-17T12:00:00.500Z'],
+      ['date only', '2027-01-17'],
+      ['a human date', 'Jan 17 2027'],
+      ['a UTC offset instead of Z', '2027-01-17T12:00:00+02:00'],
+    ] as const) {
+      check(`REFUSES a time Pact cannot parse (${label})`, build({ PCO_STARTS: t }).aborted);
+    }
+
+    // A raw newline is a Pact LEXICAL error, and PCO_BODY is allowed 2000 chars,
+    // so a pasted multi-paragraph rationale is the natural way to hit it.
+    const nl = build({ PCO_BODY: 'First paragraph.\n\nSecond paragraph.' });
+    check('REFUSES a newline in the body (a Pact lexical error, not a runtime one)',
+      nl.aborted && /newline/.test(nl.out), nl.out.slice(0, 140));
+
+    // PCO_PID was the one operator string never passed through clean(), and both
+    // " and \ are ASCII so the ASCII check did not cover them.
+    check('REFUSES a quote in the proposal id', build({ PCO_PID: 'q"1' }).aborted);
+    check('REFUSES a backslash in the proposal id', build({ PCO_PID: 'q\\1' }).aborted);
+    check('REFUSES a backslash in the title', build({ PCO_TITLE: 'back\\slash' }).aborted);
+    check('REFUSES a quote in an option', build({ PCO_OPTIONS: 'Alpha|Be"ta' }).aborted);
+    check('REFUSES a non-ASCII proposal id', build({ PCO_PID: 'q-café' }).aborted);
+    check('REFUSES a body over 2000 chars', build({ PCO_BODY: 'x'.repeat(2001) }).aborted);
+    check('REFUSES a proposal id over 64 chars', build({ PCO_PID: 'q'.repeat(65) }).aborted);
+    check('REFUSES an option over 60 chars', build({ PCO_OPTIONS: `Alpha|${'b'.repeat(61)}` }).aborted);
+
+    // Fail-closed on a forgotten variable, like every other step. TWO distinct
+    // paths: an empty value trips the length check, while a genuinely UNSET
+    // variable defaults to the TO-FILL placeholder and passes every pid check —
+    // it is caught only by emit(). The old test exercised the first and was named
+    // for the second.
+    check('REFUSES an empty PCO_PID', build({ PCO_PID: '' }).aborted);
+    const unset = build({ PCO_PID: undefined as unknown as string });
+    check('REFUSES a genuinely UNSET PCO_PID rather than emitting a TO-FILL question',
+      unset.aborted && /TO-FILL/.test(unset.out), unset.out.slice(0, 140));
+  } finally {
+    if (had) writeFileSync(cfgPath, prior as string);
+    else rmSync(cfgPath, { force: true });
+    cleanupOut(outBefore);
+  }
+}
+
 // ------------------------------- the bless gate is MODULE-AWARE, both ways
 // Requiring a bless on every module made the sanctioned freeze order
 // unbuildable: its step 4 redeploys `pco-claim` AFTER `pco` is frozen, to
@@ -382,14 +547,34 @@ console.log('ceremony tooling checks\n');
       return { aborted: true, out: String(e.stdout ?? '') + String(e.stderr ?? '') };
     }
   };
+  const pcoPath = new URL('../../contracts/pco.pact', import.meta.url);
+  const pcoOriginal = readFileSync(pcoPath, 'utf8');
   try {
     const claim = upgrade('pco-claim');
     check('the freeze order step 4 (redeploy pco-claim) can actually be BUILT',
       !claim.aborted, claim.out.slice(0, 100));
+    // This build was previously REFUSED, because `pco` carried no bless
+    // and an unblessed upgrade strands every in-flight cross-chain transfer and
+    // breaks both dependents' pins. The permanent bless supplies that, so the upgrade is now
+    // buildable — which is the point of carrying it, not a side effect.
     const token = upgrade('pco');
-    check('an unblessed `pco` upgrade is still REFUSED (it owns the defpact and both dependents pin it)',
-      token.aborted && /carries no \(bless/.test(token.out), token.out.slice(0, 100));
+    check('a `pco` upgrade BUILDS now that C1 blesses the deployed hash',
+      !token.aborted, token.out.slice(0, 200));
+    // ...and the gate that forced C1 is still live. Without this, the gate would be
+    // permanently satisfied by C1 and never exercised again: a check that can no
+    // longer fail has stopped being a check. Strip the bless and the SAME build
+    // must refuse. Fails closed — if the strip removed nothing the build succeeds
+    // and this check goes red.
+    writeFileSync(pcoPath, pcoOriginal.replace(/^[ \t]*\(bless\s+"[^"]*"\)[ \t]*\r?\n/gm, ''));
+    const stripped = upgrade('pco');
+    check('...and is still REFUSED if that bless is removed',
+      stripped.aborted && /carries no \(bless/.test(stripped.out), stripped.out.slice(0, 100));
   } finally {
+    // Restore FIRST, then prove it. A restore that silently failed would leave a
+    // tracked contract mutilated, and the next thing to read it is a deploy build.
+    writeFileSync(pcoPath, pcoOriginal);
+    check('contracts/pco.pact restored byte-for-byte after the bless-strip probe',
+      readFileSync(pcoPath, 'utf8') === pcoOriginal, 'THE CONTRACT ON DISK IS MODIFIED — git checkout it');
     // restore the EXACT prior state: the developer's config, or no file at all
     if (had) writeFileSync(cfgPath, prior as string);
     else rmSync(cfgPath, { force: true });

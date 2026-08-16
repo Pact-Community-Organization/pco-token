@@ -74,9 +74,12 @@ if (NETWORK_ID === 'mainnet01') {
   const devs = [cfg.deviceA, cfg.deviceB, cfg.deviceC];
   devs.forEach((d, i) => { if (!/^[0-9a-f]{64}$/.test(d ?? '')) die(`device${'ABC'[i]} is not a 64-hex pubkey`); });
   if (new Set(devs).size !== 3) die('deviceA/B/C are not three distinct keys');
-  // totalSupply feeds BOTH the deploy data (the token's supply constant) and the
-  // mint amounts. A typo here mis-parameterises the one irreversible step.
-  if (cfg.totalSupply !== 1000000.0) die(`totalSupply is ${cfg.totalSupply}, expected 1000000.0`);
+  // totalSupply now feeds ONLY the mint split (90% pool / 10% reserve). Since
+  // cold-audit F3 the token's supply constant is a LITERAL in pco.pact, so this
+  // value can no longer redefine it — but a typo here still mis-parameterises
+  // the mint, which is one-shot. The equality check is what makes the two agree:
+  // if pco.pact's TOTAL-SUPPLY ever changes, this must change with it.
+  if (cfg.totalSupply !== 1000000.0) die(`totalSupply is ${cfg.totalSupply}, expected 1000000.0 (must equal pco.pact's TOTAL-SUPPLY literal)`);
 }
 
 const KS = `${cfg.ns}.pco-gov`;
@@ -90,10 +93,16 @@ const GOV_KEYS = { keys: [cfg.deviceA, cfg.deviceB, cfg.deviceC], pred: 'keys-2'
 // via set-ops-guard. Device C is the break-glass seat and stays out of the
 // routine tier deliberately.
 const OPS_KEYS = { keys: [cfg.deviceA, cfg.deviceB], pred: 'keys-any' };
-const DEPLOY_DATA = {
-  ns: cfg.ns, upgrade: false, symbol: 'PCO', precision: 12,
-  'total-supply': cfg.totalSupply,
-};
+// `ns` is the ONLY value the modules still read from the data block, and it is
+// the only one that genuinely differs between networks — which is what lets
+// devnet and mainnet deploy byte-identical source.
+//
+// symbol / precision / total-supply were removed here after cold-audit F3 made
+// them literals in pco.pact. Keeping them would have been harmless but false: it
+// would suggest this file still governs values the module no longer reads, and
+// the whole point of F3 is that a data block can no longer restate the token.
+// Neither pco-claim nor pco-gas-station reads them (verified by grep).
+const DEPLOY_DATA = { ns: cfg.ns, upgrade: false };
 const contract = (f: string) => readFileSync(new URL(`../../contracts/${f}`, import.meta.url), 'utf8');
 
 // signer slots: [gas softkey (coin.GAS only), then each device]
@@ -259,14 +268,25 @@ switch (step) {
   // 20-chain fan-out, which is the expensive direction. Limits below are ~2x the
   // measured cost. The station keeps a proportionally larger margin because it
   // is the one module with no mainnet measurement yet.
+    // GAS LIMITS, RE-DERIVED FROM RECEIPTS 2026-08-15 (fresh-genesis devnet, worst
+    // of 20 chains). The previous values had drifted BELOW what the contracts now
+    // cost and would have failed outright on a fresh deploy:
+    //     pco-claim  measured 78,717  allowance was 60,000
+    //     station    measured 70,566  allowance was 40,000
+    // ≥2x margin is not attainable here — chainweb's per-transaction ceiling is
+    // 150,000, and 2x a 78,717 deploy is 157,434 — so these sit at the ceiling and
+    // the margin is stated rather than implied: ~1.9x for pco-claim, ~2.1x for the
+    // station. The UPGRADE path, which is what the the chain-local voting design ceremony runs,
+    // measured 38,451 (pco) and 19,477 (pco-claim) against its own 90,000 and is
+    // comfortable at ~2.3x.
   case 'deploy-token':
-    for (const ch of chains) emit(`30-token-c${ch}`, ceremonyTx(contract('pco.pact'), ch, DEPLOY_DATA, 90000, AB));
+    for (const ch of chains) emit(`30-token-c${ch}`, ceremonyTx(contract('pco.pact'), ch, DEPLOY_DATA, 150000, AB));
     break;
   case 'deploy-claim':
-    for (const ch of chains) emit(`31-claim-c${ch}`, ceremonyTx(contract('pco-claim.pact'), ch, DEPLOY_DATA, 60000, AB));
+    for (const ch of chains) emit(`31-claim-c${ch}`, ceremonyTx(contract('pco-claim.pact'), ch, DEPLOY_DATA, 150000, AB));
     break;
   case 'deploy-station':
-    for (const ch of chains) emit(`32-station-c${ch}`, ceremonyTx(contract('pco-gas-station.pact'), ch, DEPLOY_DATA, 40000, AB));
+    for (const ch of chains) emit(`32-station-c${ch}`, ceremonyTx(contract('pco-gas-station.pact'), ch, DEPLOY_DATA, 150000, AB));
     break;
   case 'mint':
     emit(`40-mint-c${HUB}`, ceremonyTx(
@@ -386,6 +406,149 @@ switch (step) {
     emit(`51-create-round-${rid}-c${HUB}`, ceremonyTx(
       `(${C}.create-round "${rid}" "${rhash}" ${amount} ${budget} (time "${opens}") (time "${closes}"))`,
       HUB, {}, 3000, A_SOLO));
+    break;
+  }
+  case 'create-proposal': {
+    // OPEN A RANKED-CHOICE QUESTION ON ALL 20 CHAINS (the chain-local voting design). Ops solo,
+    // so 20 transactions and 20 approvals.
+    //
+    // env: PCO_PID PCO_TITLE PCO_OPTIONS ("a|b|c") PCO_STARTS PCO_ENDS
+    //      [PCO_BODY] [PCO_CREATED, default: now]
+    //
+    // THE 20 TRANSACTIONS MUST CARRY BYTE-IDENTICAL ARGUMENTS. That is not
+    // tidiness: the id is what joins the copies, the ordered options index the
+    // pairwise matrix, and one shared absolute ends-at is the anti-double-vote
+    // control. If one chain gets anything different, the combiner refuses to
+    // publish — and you find that out AFTER people have voted. So the arguments
+    // are built once, reused for all 20, and the identity is asserted below.
+    //
+    // EVERY BOUND THE CONTRACT ENFORCES IS CHECKED HERE FIRST. The contract
+    // rejects a bad question at RUN time, which for a 20-chain ops step means
+    // discovering it after the approvals are spent — the same reasoning as
+    // freeze-source's hash-shape check. Cheaper to refuse now.
+    const pid = process.env.PCO_PID ?? 'TO-FILL-PROPOSAL-ID';
+    const title = process.env.PCO_TITLE ?? 'TO-FILL-TITLE';
+    const body = process.env.PCO_BODY ?? '';
+    const optsRaw = process.env.PCO_OPTIONS ?? 'TO-FILL-OPTIONS-pipe-separated';
+    const starts = process.env.PCO_STARTS ?? 'TO-FILL-STARTS-Z';
+    const ends = process.env.PCO_ENDS ?? 'TO-FILL-ENDS-Z';
+    const created = process.env.PCO_CREATED ?? new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+    const bad = (m: string) => { console.error(`ABORT: ${m}`); process.exit(2); };
+    // Refuse quotes and backslashes rather than escaping or substituting them.
+    // These strings are interpolated into Pact source AND are published verbatim
+    // as the question the community reads; silently turning a " into a ' (which
+    // event-ops.ts does for grant reasons) alters a governance question's text
+    // without telling anyone.
+    // Printable ASCII plus tab, nothing else. A quote or backslash would break the
+    // literal; a raw NEWLINE is a Pact LEXICAL error (measured against 5.4:
+    // "String literal parsing error: newline in string literal") and PCO_BODY is
+    // allowed 2000 characters, so a multi-paragraph rationale is the natural thing
+    // to paste there — it would have built 20 files, spent 20 approvals, and then
+    // failed to parse on every chain.
+    // TWO reasons a character is unsafe, and both must be checked. `"` and `\`
+    // are PRINTABLE ASCII, so a printable-range test alone silently stops
+    // rejecting them — which is exactly what an earlier version of this did until
+    // the quote test caught it.
+    const clean = (s: string, what: string) => {
+      const off = [...s].find((c) => c === '"' || c === '\\' || !/[\x20-\x7E\t]/.test(c));
+      if (off !== undefined) {
+        const named = off === '\n' ? 'a newline' : off === '"' ? 'a double quote'
+          : off === '\\' ? 'a backslash' : `the character ${JSON.stringify(off)}`;
+        bad(`${what} contains ${named} — it would break the Pact string literal, and this text is also ` +
+            `published verbatim as the question people read, so it is refused rather than substituted. Rewrite it.`);
+      }
+      return s;
+    };
+    // Lengths in CODE POINTS, matching Pact's `length`. JS .length counts UTF-16
+    // units, so a title with an emoji measured longer here than on chain — strictly
+    // over-strict, but it would reject a legitimate question.
+    const len = (s: string) => [...s].length;
+    // PCO_PID was the ONE operator string not passed through clean(), and " and \
+    // are both ASCII, so the ASCII check below never covered them. The contract
+    // cannot cover it either: validate-proposal-id bans only ':' and non-ASCII.
+    clean(title, 'PCO_TITLE'); clean(body, 'PCO_BODY'); clean(pid, 'PCO_PID');
+    if (len(title) < 1 || len(title) > 120) bad(`PCO_TITLE must be 1..120 chars (got ${len(title)})`);
+    if (len(body) > 2000) bad(`PCO_BODY must be <= 2000 chars (got ${len(body)})`);
+    if (pid.includes(':')) bad("PCO_PID must not contain ':' — ballot rows are keyed '<pid>:<account>'");
+    if (len(pid) < 1 || len(pid) > 64) bad(`PCO_PID must be 1..64 chars (got ${len(pid)})`);
+
+    const options = optsRaw.split('|').map((o) => o.trim());
+    options.forEach((o) => clean(o, 'each PCO_OPTIONS entry'));
+    if (options.length < 2 || options.length > 5) bad(`PCO_OPTIONS needs 2..5 pipe-separated options (got ${options.length})`);
+    if (new Set(options).size !== options.length) bad('PCO_OPTIONS must be distinct');
+    options.forEach((o) => { if (len(o) < 1 || len(o) > 60) bad(`each option must be 1..60 chars (got "${o.slice(0, 20)}…")`); });
+
+    // Pact's `(time "...")` accepts %Y-%m-%dT%H:%M:%SZ and NOTHING else, while
+    // Date.parse is famously permissive. Measured: "2026-08-17T12:00:00.500Z",
+    // "2026-08-17" and "Aug 17 2026" all satisfy Date.parse and all fail on chain.
+    // The worst is an offset like "+02:00" — Date.parse silently converts it, so
+    // the 12h announce floor is checked against a DIFFERENT instant than the one
+    // written into the transaction. Date.parse also accepts strings containing a
+    // double quote (V8 skips parenthesised text), which is why these are cleaned
+    // as well as shape-checked.
+    const at = (s: string, what: string) => {
+      clean(s, what);
+      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(s)) {
+        bad(`${what} must be exactly YYYY-MM-DDTHH:MM:SSZ — Pact's (time "...") accepts nothing else. Got "${s}"`);
+      }
+      const t = Date.parse(s);
+      if (Number.isNaN(t)) bad(`${what} is not a real instant: "${s}"`);
+      return t;
+    };
+    const tc = at(created, 'PCO_CREATED'), ts = at(starts, 'PCO_STARTS'), te = at(ends, 'PCO_ENDS');
+    if ((ts - tc) / 1000 < 12 * 3600) bad(`voting must open at least 12h after PCO_CREATED (gap is ${((ts - tc) / 3600000).toFixed(1)}h)`);
+    if (te <= ts) bad('PCO_ENDS must be after PCO_STARTS');
+    if ((te - ts) / 1000 > 8760 * 3600) bad('a question may not run longer than a year');
+    // created-at is bounded BOTH WAYS by the contract (`abs (diff-time created-at
+    // now) <= CREATED-SKEW-SECONDS`), deliberately: too far back dodges the 12h
+    // floor, too far forward fabricates the announce window. This check used to
+    // compute `3600 - (now - tc)`, which for a FUTURE created-at grows past 3600
+    // and can never fire — so a PCO_CREATED three hours ahead built cleanly,
+    // printed a reassuring "240 more minutes", and was rejected by all 20 chains.
+    const skewSec = (Date.now() - tc) / 1000;
+    if (Math.abs(skewSec) >= 3600) {
+      bad(`PCO_CREATED is ${Math.abs(skewSec / 60).toFixed(0)} minutes ${skewSec > 0 ? 'old' : 'in the FUTURE'} — ` +
+          `the contract bounds it to +/-1h of each chain's clock, both ways. Rebuild with a current PCO_CREATED.`);
+    }
+    const skewLeft = 3600 - skewSec;
+
+    const optionList = options.map((o) => `"${o}"`).join(' ');
+    const code = `(${T}.create-proposal "${pid}" "${title}" "${body}" [${optionList}]`
+               + ` (time "${created}") (time "${starts}") (time "${ends}"))`;
+
+    const built = chains.map((ch) => {
+      const tx = ceremonyTx(code, ch, {}, 8000, A_SOLO);
+      return { ch, tx };
+    });
+    // The property this step exists to guarantee, asserted rather than assumed.
+    //
+    // Compares everything that DEFINES the question, not just `code`. Comparing
+    // `code` alone was tautological: all 20 are built from the same constant and
+    // ceremonyTx never touches it, so that check could not fail.
+    //
+    // Three fields are excluded because they legitimately differ and comparing
+    // them produces a false abort: chainId (the entire point), and creationTime
+    // and nonce, which ceremonyTx stamps per call — 20 builds straddle a second
+    // boundary, so those vary by construction and vary harmlessly. What must be
+    // identical is the payload, the signers and the gas envelope: those are what
+    // make the 20 transactions one question.
+    const shapes = new Set(built.map((b) => {
+      const c = JSON.parse(b.tx.cmd);
+      c.meta.chainId = '<chain>'; c.meta.creationTime = 0; c.nonce = '<nonce>';
+      return JSON.stringify(c);
+    }));
+    if (shapes.size !== 1) {
+      console.error(`ABORT: the ${built.length} transactions differ by more than chainId/creationTime/nonce ` +
+                    `(${shapes.size} variants) — a question whose copies differ cannot be combined`);
+      process.exit(2);
+    }
+    for (const { ch, tx } of built) emit(`60-create-proposal-${pid}-c${ch}`, tx);
+    console.log(`\n  ${built.length} transactions, identical arguments, id "${pid}".`);
+    console.log(`  opens ${starts}   closes ${ends}`);
+    console.log(`  options: ${options.map((o, i) => `[${i}] ${o}`).join('   ')}`);
+    console.log(`  ⚠ created-at ${created} — every chain must land within ${(skewLeft / 60).toFixed(0)} more minutes.`);
+    console.log(`  AFTER submitting: npx tsx src/verify-proposal.ts ${pid}   — do not announce until it is 20/20.`);
     break;
   }
   case 'grant': {
@@ -514,7 +677,9 @@ switch (step) {
     // alone: it owns the only defpact, and both other modules depend on it.
     // Nothing depends on `pco-claim` or `pco-gas-station`, and neither defines a
     // defpact, so an unblessed redeploy of those strands nothing.
-    const NEEDS_BLESS = new Set(['pco']);
+    // Canonical, shared with verify-deployed — which checks the STRONGER property
+    // this gate cannot see offline: that the bless matches the hash actually live.
+    const { NEEDS_BLESS } = await import('./freeze-source.js');
     if (NEEDS_BLESS.has(mod) && !/\(bless\s/.test(body) && process.env.PCO_UPGRADE_NO_BLESS !== 'i-understand') {
       console.error(`ABORT: ${file} carries no (bless ...) form.`);
       console.error('       An unblessed upgrade permanently strands every in-flight cross-chain');

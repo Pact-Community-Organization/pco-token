@@ -205,7 +205,8 @@
 
 (begin-tx "vote key: a cleared (inactive) hot key cannot vote")
 (env-keys ["ledger-a"])
-(free.pco.create-proposal "the vote" "b" ["a" "b"] 72)
+(free.pco.create-proposal "1" "the vote" "b" ["a" "b"] (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-04T12:00:00Z"))
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })  ; inside [starts-at, ends-at) — every ballot below depends on it
 (env-data { "vk": { "keys": ["hot-key"], "pred": "keys-all" } })
 (env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE-KEY-ADMIN "whale" (create-principal (read-keyset 'vk))), (free.pco.VOTE-KEY-ADMIN "whale" "")] } ])
 (free.pco.set-vote-key "whale" (read-keyset 'vk))
@@ -230,7 +231,7 @@
 (env-sigs [ { "key": "hot-key", "caps": [] } ])
 (expect-failure "hot key cannot open a proposal (admin-authored)"
   "governance or ops authority required"
-  (free.pco.create-proposal "t" "b" ["a" "b"] 72))
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (env-sigs [ { "key": "hot-key", "caps": [(free.pco.VOTE-KEY-ADMIN "whale" "")] } ])
 (expect-failure "hot key cannot clear the registration" "Keyset failure"
   (free.pco.clear-vote-key "whale"))
@@ -270,76 +271,187 @@
 (env-sigs [ { "key": "whale-key", "caps": [] } ])
 (expect-failure "a token holder cannot create on-chain proposals"
   "governance or ops authority required"
-  (free.pco.create-proposal "t" "b" ["a" "b"] 72))
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (env-keys ["ledger-b"])
 (expect-failure "a single NON-ops governance key fails both branches"
   "governance or ops authority required"
-  (free.pco.create-proposal "t" "b" ["a" "b"] 72))
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (rollback-tx)
 
-(begin-tx "propose: duration below the minimum rejected")
+;; REPLACED 2026-08-14 (the chain-local voting design C4/C8). These two blocks used to assert
+;; "duration outside [24h, 720h]" against a duration-hours argument. That
+;; argument is GONE: a relative duration computed from local block time gives 20
+;; different deadlines for one question, which is the double-vote hole this
+;; change exists to close. The bounds that replaced it are asserted instead, and
+;; each is the load-bearing half of a decision:
+;;   * the 12h announce floor - what guarantees all 20 copies have landed and
+;;     been verified before the first ballot, and what gives "cancel before it
+;;     starts" a real window to act in
+;;   * ends-at after starts-at - a window that is empty or inverted
+;;   * the one-year span cap - keeps "forever" out of a module that freezes,
+;;     because every open question is walked on every balance-reducing transfer
+;; The clock here is 2026-08-01T12:00:01Z (set above), so created-at must match
+;; it within CREATED-SKEW or the call is refused before these bounds are reached.
+(begin-tx "propose: voting may not open sooner than the announce floor")
 (env-keys ["ledger-a"])
-(expect-failure "duration < 24h" "duration outside"
-  (free.pco.create-proposal "t" "b" ["a" "b"] 23))
+(expect-failure "starts-at 11h out is inside the 12h floor" "at least 12h after"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-01T23:00:01Z") (time "2026-08-05T00:00:01Z")))
 (rollback-tx)
 
-(begin-tx "propose: duration above the maximum rejected")
+(begin-tx "propose: exactly 12h is ACCEPTED (boundary, not off-by-one)")
 (env-keys ["ledger-a"])
-(expect-failure "duration > 720h" "duration outside"
-  (free.pco.create-proposal "t" "b" ["a" "b"] 721))
+(expect "exactly the floor is allowed" "t"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
+(rollback-tx)
+
+(begin-tx "propose: the voting window may not be empty or inverted")
+(env-keys ["ledger-a"])
+(expect-failure "ends-at equal to starts-at" "must close after it opens"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-02T00:00:01Z")))
+(expect-failure "ends-at before starts-at" "must close after it opens"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-01T23:00:01Z")))
+(rollback-tx)
+
+;; THE MINIMUM VOTING WINDOW (cold audit F1, 2026-08-14). The deployed mainnet
+;; module bounded `duration-hours` to [24h, 720h]; C4 replaced that parameter with
+;; explicit instants and the FLOOR was dropped rather than ported, so a one-second
+;; window satisfied every other rule - it passes the 12h announce floor, the
+;; ordering check and the span cap. Nothing in the suite went red, because the old
+;; assertion had been removed and replaced with a comment rather than a
+;; replacement. Both sides of the boundary are pinned here so that cannot recur.
+(begin-tx "propose: a voting window shorter than 24h is refused")
+(env-keys ["ledger-a"])
+(expect-failure "a one-second window" "at least 24h"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-02T00:00:02Z")))
+(expect-failure "one second under the floor" "at least 24h"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-03T00:00:00Z")))
+(rollback-tx)
+
+(begin-tx "propose: exactly 24h is ACCEPTED (boundary, not off-by-one)")
+(env-keys ["ledger-a"])
+(expect "exactly the minimum window is allowed" "t"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-03T00:00:01Z")))
+(rollback-tx)
+
+;; THE MAXIMUM VOTING WINDOW — 30 days (founder, 2026-08-14, reversing the
+;; one-year ceiling of 2026-08-13). The ceiling is load-bearing for a reason that
+;; is not obvious: admin-cancel-proposal is refused once starts-at has passed, so
+;; this is ALSO the longest a mistyped ends-at can hold one of three slots on
+;; every chain it landed on, with no close path of any kind. Both sides pinned.
+(begin-tx "propose: a question may not run longer than 30 days")
+(env-keys ["ledger-a"])
+(expect-failure "a span of one year" "longer than 30 days"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2027-08-02T01:00:01Z")))
+(expect-failure "one second over 30 days" "longer than 30 days"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-09-01T00:00:02Z")))
+(rollback-tx)
+
+(begin-tx "propose: exactly 30 days is ACCEPTED (boundary, not off-by-one)")
+(env-keys ["ledger-a"])
+(expect "exactly the maximum window is allowed" "t"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-09-01T00:00:01Z")))
+(rollback-tx)
+
+;; THE REPLICATION PROPERTY (the chain-local voting design C4/C8). The 12h floor must be measured
+;; from the supplied created-at and NEVER from the local block time. If it were
+;; local, two chains whose clocks differ would disagree about whether the SAME
+;; starts-at is legal, and one question would exist on some chains and not on
+;; others - the exact failure this ADR exists to prevent, and one that would ship
+;; silently because each chain's own transaction succeeds.
+;;
+;; The chain here is 30 minutes AHEAD, deliberately. A chain BEHIND would accept
+;; these parameters under either rule and prove nothing: only a chain far enough
+;; ahead that local+12h has passed starts-at can tell the two rules apart.
+;;   created-at 12:00:01 + 12h = 00:00:01  -> starts-at is exactly legal
+;;   local      12:30:01 + 12h = 00:30:01  -> a local rule would REFUSE this
+(begin-tx "propose: the 12h floor comes from created-at, not this chain's clock")
+(env-keys ["ledger-a"])
+(env-chain-data { "chain-id": "7", "block-time": (time "2026-08-01T12:30:01Z") })
+(expect "a chain 30 minutes AHEAD accepts the identical parameters" "rep"
+  (free.pco.create-proposal "rep" "t" "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
+(rollback-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })
+
+(begin-tx "propose: created-at must sit near THIS chain's clock, both ways")
+(env-keys ["ledger-a"])
+;; Bounded on both sides deliberately. Too far forward fabricates the announce
+;; window; too far back dodges the 12h floor by backdating.
+(expect-failure "created-at backdated a day" "too far from this chain's clock"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-07-31T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
+(expect-failure "created-at a day in the future" "too far from this chain's clock"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"]
+    (time "2026-08-02T12:00:01Z") (time "2026-08-03T12:00:01Z") (time "2026-08-06T00:00:01Z")))
 (rollback-tx)
 
 (begin-tx "propose: empty title rejected")
 (env-keys ["ledger-a"])
 (expect-failure "empty title" "title 1..120"
-  (free.pco.create-proposal "" "b" ["a" "b"] 72))
+  (free.pco.create-proposal "t" "" "b" ["a" "b"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (rollback-tx)
 
 (begin-tx "propose: over-long title rejected")
 (env-keys ["ledger-a"])
 (expect-failure "title > 120 chars"  "title 1..120"
   (free.pco.create-proposal
-    "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890X"
-    "b" ["a" "b"] 72))
+    "t" "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890X"
+    "b" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (rollback-tx)
 
 (begin-tx "propose: option-list bounds enforced")
 (env-keys ["ledger-a"])
 (expect-failure "one option is not a question" "2..5 options required"
-  (free.pco.create-proposal "t" "b" ["only"] 72))
+  (free.pco.create-proposal "t" "t" "b" ["only"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (expect-failure "more than MAX-OPTIONS refused" "2..5 options required"
-  (free.pco.create-proposal "t" "b" ["a" "b" "c" "d" "e" "f"] 72))
+  (free.pco.create-proposal "t" "t" "b" ["a" "b" "c" "d" "e" "f"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (expect-failure "duplicate options refused" "options must be distinct"
-  (free.pco.create-proposal "t" "b" ["a" "a"] 72))
+  (free.pco.create-proposal "t" "t" "b" ["a" "a"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (expect-failure "empty option label refused" "each option 1..60 chars"
-  (free.pco.create-proposal "t" "b" ["a" ""] 72))
+  (free.pco.create-proposal "t" "t" "b" ["a" ""] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (expect-failure "over-long option label refused" "each option 1..60 chars"
-  (free.pco.create-proposal "t" "b"
-    ["a" "0123456789012345678901234567890123456789012345678901234567890"] 72))
+  (free.pco.create-proposal "t" "t" "b"
+    ["a" "0123456789012345678901234567890123456789012345678901234567890"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (rollback-tx)
 
-(begin-tx "propose: off-hub rejected")
-(env-chain-data { "chain-id": "4" })
+;; INVERTED 2026-08-14 (the chain-local voting design C2), same as pco.repl's twin. This asserted
+;; "governance is hub-only", which was the defect rather than the requirement -
+;; and its existence is precisely why hub-only survived unnoticed: the suite
+;; encoded the implementer's belief, so the belief could never go red.
+(begin-tx "propose: a question publishes to a chain other than the hub")
+(env-chain-data { "chain-id": "4", "block-time": (time "2026-08-01T12:00:01Z") })
 (env-keys ["ledger-a"])
-(expect-failure "governance is hub-only" "hub chain only"
-  (free.pco.create-proposal "t" "b" ["a" "b"] 72))
+(expect "the same question publishes off-hub" "t"
+  (free.pco.create-proposal "t" "t" "b" ["a" "b"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (rollback-tx)
-(env-chain-data { "chain-id": "0" })
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })
 
 ;; MAX-ACTIVE-PROPOSALS: open 3, the 4th must fail
 (begin-tx "propose: 3 open then the 4th refused")
 (env-keys ["ledger-a"])
-(free.pco.create-proposal "p1" "b" ["a" "b"] 72)
-(free.pco.create-proposal "p2" "b" ["a" "b"] 72)
-(free.pco.create-proposal "p3" "b" ["a" "b"] 72)
+(free.pco.create-proposal "p1" "p1" "b" ["a" "b"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z"))
+(free.pco.create-proposal "p2" "p2" "b" ["a" "b"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z"))
+(free.pco.create-proposal "p3" "p3" "b" ["a" "b"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z"))
 (expect-failure "4th proposal refused" "too many active proposals"
-  (free.pco.create-proposal "p4" "b" ["a" "b"] 72))
+  (free.pco.create-proposal "p4" "p4" "b" ["a" "b"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (rollback-tx)
 
 ;; --- admin-cancel: the accountable early close ---
 (begin-tx "cancel: reason mandatory, authorization enforced, close is final")
 (env-keys ["ledger-a"])
-(free.pco.create-proposal "to-cancel" "b" ["a" "b"] 72)
+(free.pco.create-proposal "1" "to-cancel" "b" ["a" "b"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z"))
 (env-sigs [ { "key": "whale-key", "caps": [] } ])
 (expect-failure "a holder cannot cancel" "governance or ops authority required"
   (free.pco.admin-cancel-proposal "1" "r"))
@@ -352,17 +464,47 @@
 (expect "ops cancels with a public reason" "cancelled"
   (free.pco.admin-cancel-proposal "1" "duplicate of question 7 on the channels"))
 (expect "slot freed immediately" [] (free.pco.open-ids))
-(expect-failure "cannot cancel an already-closed proposal" "proposal already closed"
+(expect-failure "cannot cancel a question twice" "already cancelled"
   (free.pco.admin-cancel-proposal "1" "again"))
 (env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE "1" "whale")] } ])
-(expect-failure "no votes after a cancel" "voting closed"
+(expect-failure "no votes on a cancelled question" "this question was cancelled"
   (free.pco.cast-vote "1" "whale" [0]))
 (rollback-tx)
+
+;; THE CANCEL WINDOW'S FAR EDGE (the chain-local voting design C8). admin-cancel-proposal enforces
+;; `(< now starts-at)`, so the two instants that matter are starts-at itself and
+;; the second before it. The strictness is the point: results are readable while
+;; a question runs, so a cancel that reached past the start would be a selective
+;; veto - an operator could watch each chain's running tally and void the ones
+;; going the wrong way while the other 19 publish. Before the start there is
+;; nothing to read and nothing to void selectively, because no ballot exists
+;; anywhere yet.
+(begin-tx "cancel: still allowed one second before voting opens")
+(env-keys ["ledger-a"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })
+(free.pco.create-proposal "bd" "boundary" "b" ["a" "b"]
+  (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z"))
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-02T00:00:00Z") })
+(expect "one second before it opens, cancellation is still allowed" "cancelled"
+  (free.pco.admin-cancel-proposal "bd" "withdrawn inside the announce window"))
+(rollback-tx)
+
+(begin-tx "cancel: refused AT starts-at, not one second later")
+(env-keys ["ledger-a"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })
+(free.pco.create-proposal "bd" "boundary" "b" ["a" "b"]
+  (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z"))
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-02T00:00:01Z") })
+(expect-failure "AT starts-at the window is already shut" "voting has already opened"
+  (free.pco.admin-cancel-proposal "bd" "too late"))
+(rollback-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })
 
 ;; vote negatives (open a proposal in-tx, then attack it)
 (begin-tx "vote negatives")
 (env-keys ["ledger-a"])
-(expect "proposal opens" "1" (free.pco.create-proposal "the vote" "b" ["a" "b" "c"] 72))
+(expect "proposal opens" "1" (free.pco.create-proposal "1" "the vote" "b" ["a" "b" "c"] (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-02T00:00:02Z") })  ; inside the window these ballots attack
 
 (env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE "1" "whale")] } ])
 (expect-failure "empty ranking rejected" "ranking: 1..K entries"
@@ -395,12 +537,16 @@
 (expect-failure "zero balance has no voting weight" "no voting weight"
   (free.pco.cast-vote "1" "empty" [0]))
 
-;; vote off-hub
-(env-chain-data { "chain-id": "2" })
+;; INVERTED 2026-08-14 (the chain-local voting design C2). The vote-side twin of the create-side
+;; assertion above: this said voting was hub-only, which was the defect. THE
+;; WHOLE POINT of the change is that a holder votes on the chain their tokens
+;; are on. Kept as a positive assertion rather than deleted, because the
+;; property needs something that goes red if it is ever re-restricted.
+(env-chain-data { "chain-id": "2", "block-time": (time "2026-08-02T00:00:02Z") })
 (env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE "1" "whale")] } ])
-(expect-failure "voting is hub-only" "hub chain only"
+(expect "a ballot is accepted off the hub chain" "vote recorded"
   (free.pco.cast-vote "1" "whale" [0]))
-(env-chain-data { "chain-id": "0" })
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-02T00:00:02Z") })
 
 ;; vote after close
 (env-chain-data { "block-time": (time "2026-08-05T00:00:01Z") })   ; > 72h
@@ -509,7 +655,7 @@
 (env-keys [])
 (env-sigs [])
 (env-keys ["ledger-a"])
-(free.pco.create-proposal "gapcheck" "does the gate hold?" ["a" "b"] 72)
+(free.pco.create-proposal "gapcheck" "gapcheck" "does the gate hold?" ["a" "b"] (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-04T12:00:00Z"))
 (env-keys [])
 (env-sigs [])
 (expect-failure "the internal ballot writer is not callable without VOTE"

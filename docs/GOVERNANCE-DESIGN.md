@@ -7,9 +7,13 @@ considered instead.*
 
 - **Questions are put on-chain by the organization** (the routine-ops key; the
   2-of-3 governance keyset always works too). Each question carries **2–5 named
-  options** and a voting window of 1–30 days. The community **suggests questions
-  on the public channels** (Telegram / X) and the organization makes them
-  official — an accountable, public step.
+  options**, opens **at least 12 hours after it is authored**, and runs for **at
+  least 24 hours and at most 30 days**. The community **suggests questions on the
+  public channels** (Telegram / X) and the organization makes them official — an
+  accountable, public step.
+- **A question is published to all 20 chains** and holders vote on whichever
+  chains hold their tokens; the 20 tallies are summed off-chain into one result
+  (the chain-local voting design). Claims stay on the hub chain.
 - **Voting is open to every holder and ranked-choice**: you rank the options in
   order of preference (partial rankings allowed). Tallies are live **Borda
   scores** — with K options, your first choice earns K points per token of
@@ -47,12 +51,17 @@ considered instead.*
   `turnout * K(K+1)/2` to see how much of the electorate ranked fully. It is not
   the verdict.
 - The **live-weight discipline is unchanged**: your ballot's weight is your
-  current hub-chain balance; moving tokens away automatically shrinks your open
-  ballots; received tokens arrive unvoted; re-voting replaces your ballot in
-  place. Votes remain **advisory** — they execute nothing on-chain.
+  current balance **on the chain you vote from**; moving tokens away
+  automatically shrinks your open ballots; received tokens arrive unvoted;
+  re-voting replaces your ballot in place. Votes remain **advisory** — they
+  execute nothing on-chain.
 - The organization can **cancel a question early** (`admin-cancel-proposal`)
   with a **mandatory public reason** emitted on-chain — freezing the scores and
-  freeing the slot, accountably.
+  freeing the slot, accountably. **Only before voting opens.** Once a question is
+  running it cannot be cancelled by anyone, which is deliberate: results are
+  readable throughout, so a cancel that reached past the start would let the
+  organization watch each chain's tally and void the ones going the wrong way.
+  The 30-day maximum window is what bounds the cost of that strictness.
 
 ## The risk that shaped this design
 

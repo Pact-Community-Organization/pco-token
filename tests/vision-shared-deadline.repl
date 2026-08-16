@@ -1,0 +1,130 @@
+;; vision-shared-deadline.repl — PROMOTED 2026-08-14, now in the main suite.
+;;
+;; It was a must-fail file and it did fail, for the stated reason, until
+;; the chain-local voting design C4 landed. It now PASSES. The history below is kept deliberately:
+;; it is the argument for why the deadline must be absolute, and the founder's
+;; acceptance of the residual window rests on it.
+;;
+;; THE PROPERTY: every copy of one question, on all 20 chains, must close at ONE
+;; ABSOLUTE INSTANT — regardless of when each copy's transaction happened to land.
+;;
+;; WHY THIS IS THE ANTI-DOUBLE-VOTE CONTROL, NOT A TIDINESS FIX.
+;; PCO stops the same tokens voting twice by shrinking a recorded ballot whenever
+;; the holder's balance drops (`release-votes`). That protection walks only the
+;; proposals still OPEN ON THE CHAIN BEING LEFT (`open-ids`, pco.pact:997-1002).
+;; Once a chain's copy has closed, the ballot there is frozen at full strength
+;; forever — and the tokens are free to walk to a chain whose copy is still open
+;; and vote again. Both count. Measured in the engine against the deployed
+;; contract; recorded in the chain-local voting design §4 H1.
+;;
+;; The size of that window is decided HERE. `close-at` is computed as
+;; (add-time (curr-time) (hours duration-hours)) at pco.pact:1030 — from the
+;; LOCAL BLOCK TIME of whichever chain the transaction landed on. Twenty
+;; separately-signed transactions land minutes to tens of minutes apart, so the
+;; 20 copies get 20 different deadlines and the exploitable gap is however long
+;; the operator's ceremony took. A single retried chain puts it hours out.
+;;
+;; With one absolute deadline passed in (the chain-local voting design C4) the gap collapses to the
+;; natural spread between the chains' block clocks — sampled live at 40.7 s,
+;; 46.8 s and 55.1 s — which the founder ACCEPTED on 2026-08-13 on the grounds
+;; that a cross-chain transfer takes minutes, not seconds, and therefore cannot
+;; fit inside it. **That acceptance is only sound while this test passes**, which
+;; is now the case: it was a decision about ~50 seconds, not about the
+;; ceremony-sized window that existed before C4. If this file ever goes red, the
+;; founder's acceptance is void — the window it was granted over no longer exists.
+;;
+;; WHAT THIS FILE SIMULATES, STATED PLAINLY. A bare REPL has ONE database, so it
+;; cannot host 20 real chains. What it CAN do exactly is reproduce the cause: two
+;; copies of one question created at two different block times. If those two
+;; copies do not share a deadline here, they do not share one across 20 chains
+;; either — the arithmetic is the same line of code. The cross-chain consequence
+;; needs SPV and belongs on devnet, not in a REPL.
+;;
+;; 🔴 WHEN THIS FILE STARTS PASSING, THE SUITE GOES RED ON PURPOSE — run.sh will
+;; report "LOADED". That is the tripwire saying C4 has shipped and this file must
+;; be PROMOTED: rename to `vision-shared-deadline.repl`, add it to the `for f in`
+;; list in run.sh, and delete its must_fail line. Do not silence it by deleting.
+
+(env-exec-config ["RequireKeysetNs"])
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+
+(begin-tx "interfaces + coin")
+(load "fixtures/fungible-v2.pact")
+(load "fixtures/fungible-xchain-v1.pact")
+(load "fixtures/gas-payer-v1.pact")
+(load "fixtures/coin-v5.pact")
+(create-table coin.coin-table)
+(create-table coin.allocation-table)
+(commit-tx)
+
+(begin-tx "namespace + keyset + deploy")
+(env-data
+  { "ns": "free", "upgrade": false
+  , "symbol": "PCO", "precision": 12, "total-supply": 1000000.0
+  , "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" }
+  , "pco-ops": { "keys": ["ledger-a"], "pred": "keys-all" }
+  , "ns-guard": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
+(env-keys ["ledger-a", "ledger-b"])
+(define-namespace "free" (read-keyset 'ns-guard) (read-keyset 'ns-guard))
+(namespace "free")
+(define-keyset "free.pco-gov" (read-keyset 'pco-gov))
+(load "../contracts/pco.pact")
+(commit-tx)
+
+(begin-tx "ops authority + mint")
+(env-data { "ns": "free", "pco-ops": { "keys": ["ledger-a"], "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(free.pco.set-ops-guard (read-keyset 'pco-ops))
+(free.pco.init-mint
+  [ { "account": (free.pco.reserve-account)
+    , "guard": (keyset-ref-guard "free.pco-gov"), "amount": 1000000.0 } ])
+(commit-tx)
+
+;; ---------------------------------------------------------------- copy 1 of 20
+;; The first chain's transaction lands at 00:00:00.
+(begin-tx "the question is published to the first chain")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })
+(env-data { "ns": "free" })
+(env-keys ["ledger-a"]) (env-sigs [{ "key": "ledger-a", "caps": [] }])
+(expect "copy 1 is created" "1"
+  (free.pco.create-proposal "1" "Which template family next?" "one question, twenty copies"
+    ["marketplace" "vesting" "oracle"]
+    (time "2026-08-01T00:00:00Z") (time "2026-08-02T00:00:00Z") (time "2026-08-09T00:00:00Z")))
+(commit-tx)
+
+;; ---------------------------------------------------------------- copy 2 of 20
+;; A later copy's transaction lands 30 minutes on. That delay is ordinary: the
+;; copies are 20 separately-signed transactions submitted one after another, and
+;; a single retry stretches it much further. Nothing here is adversarial.
+;; NOTE the chain-id stays "0". The divergence is caused by TIME, not by chain —
+;; `close-at` is (curr-time) + duration, so two copies created at two moments get
+;; two deadlines whatever chains they sit on. Holding the chain fixed isolates
+;; this test to C4: it does not depend on the hub gate (C2) having been removed
+;; first, and it fails for exactly one reason.
+(begin-tx "the SAME question is published again 30 minutes on, as a later chain's copy would be")
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:30:00Z") })
+(env-data { "ns": "free" })
+(env-keys ["ledger-a"]) (env-sigs [{ "key": "ledger-a", "caps": [] }])
+(expect "copy 2 is created" "2"
+  (free.pco.create-proposal "2" "Which template family next?" "one question, twenty copies"
+    ["marketplace" "vesting" "oracle"]
+    ;; created-at differs (this copy landed later) but starts-at and ends-at are
+    ;; the SAME ABSOLUTE INSTANTS. That is the whole property.
+    (time "2026-08-01T00:30:00Z") (time "2026-08-02T00:00:00Z") (time "2026-08-09T00:00:00Z")))
+(commit-tx)
+
+;; ------------------------------------------------------------------ THE PROPERTY
+;; 🔴 TODAY THIS FAILS: copy 1 closes 2026-08-08T00:00:00Z and copy 2 closes
+;; 2026-08-08T00:30:00Z. For those 30 minutes copy 1 is shut while copy 2 is
+;; still taking votes — and a ballot already frozen on copy 1 keeps its full
+;; weight while the tokens behind it move to copy 2 and vote again.
+(expect "every copy of one question must close at the SAME instant"
+  (at 'ends-at (free.pco.get-proposal "1"))
+  (at 'ends-at (free.pco.get-proposal "2")))
+
+;; The same statement as a duration, so the failure output names the gap in a
+;; human unit rather than two timestamps to diff by eye.
+(expect "the gap between any two copies' deadlines must be ZERO seconds"
+  0.0
+  (diff-time (at 'ends-at (free.pco.get-proposal "2"))
+             (at 'ends-at (free.pco.get-proposal "1"))))

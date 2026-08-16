@@ -13,10 +13,49 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import {
   CHAINS, HUB, NS, SENDER00, checks, client, localCall, newKey, preflight,
-  record, send, xchain, type Keypair, type SignerSpec,
+  record, skip, send, xchain, type Keypair, type SignerSpec,
 } from './env.js';
 
 const T = `${NS}.pco`;
+
+// ---------------------------------------------------------------------------
+// PROPOSAL WINDOWS AGAINST A REAL CLOCK (the chain-local voting design C8).
+//
+// `create-proposal` now takes three absolute instants and bounds all of them:
+// created-at within +/-1h of THIS CHAIN's block time, starts-at at least 12h
+// after created-at, and the window itself 24h..30 days. The instants must
+// therefore be derived from chain time, not from `new Date()` — the devnet's
+// block time lags wall clock, and anchoring to the wrong clock is the documented
+// way this fails.
+//
+// THE STRUCTURAL CONSEQUENCE: the earliest legal starts-at is chain time + 11h,
+// so a single rehearsal run CANNOT create a question and vote on it. That is not
+// a tooling gap to work around; it is what the 12h announce floor means. Vote
+// coverage here is therefore opportunistic — see `votableProposal` below — and
+// what cannot be measured is recorded with skip(), never quietly passed.
+// ---------------------------------------------------------------------------
+const chainTime = async (chainId: string): Promise<Date> =>
+  new Date(String(await localCall("(at 'block-time (chain-data))", chainId)));
+
+const iso = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+/** The 7-argument create-proposal call, anchored to chain time. */
+function proposalCall(pid: string, title: string, body: string, options: string[], now: Date,
+                      opts: { startsInH?: number; runsH?: number } = {}) {
+  const startsInH = opts.startsInH ?? 12.5;   // just past the 12h floor
+  const runsH = opts.runsH ?? 168;            // a week, inside 24h..30d
+  const starts = new Date(now.getTime() + startsInH * 3600_000);
+  const ends = new Date(starts.getTime() + runsH * 3600_000);
+  const optList = options.map((o) => `"${o}"`).join(' ');
+  return `(${T}.create-proposal "${pid}" "${title}" "${body}" [${optList}]`
+       + ` (time "${iso(now)}") (time "${iso(starts)}") (time "${iso(ends)}"))`;
+}
+
+/** A proposal that can be voted on RIGHT NOW, if any exists from an earlier run. */
+async function votableProposal(): Promise<string | null> {
+  const open: string[] = await localCall(`(${T}.open-ids)`, HUB);
+  return open.length ? open[0] : null;
+}
 const C = `${NS}.pco-claim`;
 const G = `${NS}.pco-gas-station`;
 const KS = `${NS}.pco-gov`;
@@ -67,6 +106,15 @@ const gasCap = (kp: Keypair): SignerSpec => ({ kp, caps: (wc) => [wc('coin.GAS')
 async function main() {
   console.log(`PCO mainnet-pilot dress rehearsal — ns=${NS}, 20 chains`);
   console.log(`devices: A=${K.deviceA.publicKey.slice(0, 8)} B=${K.deviceB.publicKey.slice(0, 8)} C=${K.deviceC.publicKey.slice(0, 8)} (spare D=${K.deviceD.publicKey.slice(0, 8)})`);
+
+  // Chain time, read ONCE and reused for every proposal built in this run.
+  // created-at must sit within +/-1h of the chain's own clock, so this is also a
+  // budget: a rehearsal running longer than an hour will start failing its
+  // create-proposal calls with "created-at is too far from this chain's clock".
+  // That is a loud, self-diagnosing error rather than a silent wrong value, which
+  // is why one read is preferred to scattering fresh reads through the run.
+  const nowT = await chainTime(HUB);
+  console.log(`chain time (hub): ${iso(nowT)}  — proposals authored against this clock`);
 
   // ---------- P2: BOTH keysets (gov 2-of-3 + ops 1-key) on ALL 20 chains ----------
   console.log('\nP2  keyset ceremony ×20 (pco-gov only — ops is module state)');
@@ -338,7 +386,7 @@ async function main() {
   // claim-only: the station refuses vote / propose / PCO-transfer too
   for (const [name, code] of [
     ['cast-vote', `(${T}.cast-vote "1" "${K.deviceD.account}" [0])`],
-    ['create-proposal', `(${T}.create-proposal "t" "b" ["a" "b"] 72)`],
+    ['create-proposal', proposalCall('station-probe', 't', 'b', ['a', 'b'], nowT)],
     ['pco.transfer', `(${T}.transfer "${K.deviceD.account}" "${K.u1.account}" 1.0)`],
   ] as const) {
     const r = await preflight({
@@ -423,7 +471,7 @@ async function main() {
   // a HOLDER cannot put a proposal on-chain — questions are admin-authored
   const communityProp = await preflight({
     label: 'holder create-proposal (must fail)', chainId: HUB, sender: K.u1.account,
-    code: `(${T}.create-proposal "t" "b" ["a" "b"] 72)`,
+    code: proposalCall('holder-probe-2', 't', 'b', ['a', 'b'], nowT),
     signers: [{ kp: K.u1, caps: (wc) => [wc('coin.GAS')] }],
     gasLimit: 2500, gasPrice: 1e-7,
   });
@@ -431,122 +479,178 @@ async function main() {
     !communityProp.ok && communityProp.error.includes('governance or ops authority required'),
     communityProp.error.slice(0, 70));
 
-  // the OPS key alone opens a ranked-choice question (routine tier on-node)
-  let pid: string;
+  // the OPS key alone opens a ranked-choice question (routine tier on-node).
+  // This ALWAYS runs: it proves creation, the ops tier, and that the 12h
+  // announce floor is satisfiable against a real chain clock.
+  const freshPid = `rehearsal-${await localCall("(at 'block-height (chain-data))", HUB)}`;
   try {
     const prop = await send({
       label: 'create-proposal (OPS solo, ranked-choice)',
-      code: `(${T}.create-proposal "Which template family should the catalog grow next?" "Advisory - rank the options." ["vesting" "oracle" "marketplace"] 168)`,
+      code: proposalCall(freshPid, 'Which template family should the catalog grow next?',
+        'Advisory - rank the options.', ['vesting', 'oracle', 'marketplace'], nowT),
       chainId: HUB,
       signers: [gasCap(SENDER00), unscoped(K.deviceA)],
-      gasLimit: 4000,
+      gasLimit: 8000,
     });
-    pid = (prop.result as any).data;
-    record('P8', `RCV question ${pid} opened by the OPS key alone`, typeof pid === 'string', `gas ${prop.gas}`);
+    record('P8', `RCV question ${freshPid} opened by the OPS key alone`,
+      (prop.result as any).data === freshPid, `gas ${prop.gas}, opens in 12.5h`);
   } catch (e: any) {
     if (!String(e.message).includes('too many active proposals')) throw e;
-    const open: string[] = await localCall(`(${T}.open-ids)`, HUB);
-    pid = open[open.length - 1];
-    record('P8', `open-proposal cap held (3 max) - reusing open question ${pid}`, true);
+    record('P8', 'open-proposal cap held (3 max) - a fourth question is refused', true);
   }
-  const res0 = await localCall(`(${T}.get-results "${pid}")`, HUB);
-  const s0: number[] = res0.scores;
-  const scoresEq = (got: number[], want: number[]) =>
-    JSON.stringify(got.map((v) => Math.round(v * 100) / 100)) === JSON.stringify(want.map((v) => Math.round(v * 100) / 100));
 
-  const voteSelfPaid = (u: Keypair, ranking: number[]) => send({
-    label: `self-paid ranked ballot [${ranking}]`,
-    code: `(${T}.cast-vote "${pid}" "${u.account}" [${ranking.join(' ')}])`,
-    chainId: HUB,
-    signers: [{ kp: u, caps: (wc) => [wc('coin.GAS'), wc(`${T}.VOTE`, pid, u.account)] }],
-    gasLimit: 3000, gasPrice: 1e-7,
-  });
-  // K=3: position p contributes weight*(3-p). u2 (100): [0] -> +300 opt0.
-  // u3 (100): [1 0] -> +300 opt1, +200 opt0.
-  await voteSelfPaid(K.u2, [0]);
-  await voteSelfPaid(K.u3, [1, 0]);
-  let res = await localCall(`(${T}.get-results "${pid}")`, HUB);
-  record('P8', 'Borda scores: u2 [0] and u3 [1,0] tallied live',
-    scoresEq(res.scores, [s0[0] + 500, s0[1] + 300, s0[2]]) && res.turnout === res0.turnout + 200,
-    JSON.stringify(res.scores).slice(0, 80));
-
-  // live release: u2 moves 40 away -> ballot [0] sheds 40 weight = -120 points
+  // THE REPLICATION PROPERTY, ON-NODE (the chain-local voting design). A question is one question
+  // only because the SAME id and the SAME three instants land on every chain.
+  // Rehearsed here on two chains rather than twenty — the ceremony's cost is
+  // linear and proving it twice proves the mechanism; what this catches is a
+  // create path that silently derives anything from local state.
+  const c1Pid = `${freshPid}-c1`;
   await send({
-    label: 'u2 transfers 40 to u3 (ballot release)',
-    code: `(${T}.transfer "${K.u2.account}" "${K.u3.account}" 40.0)`,
-    chainId: HUB,
-    signers: [
-      gasCap(SENDER00),
-      { kp: K.u2, caps: (wc) => [wc(`${T}.TRANSFER`, K.u2.account, K.u3.account, { decimal: '40.0' })] },
-    ],
-    gasLimit: 4000,
+    label: 'the same question published to chain 1 (identical arguments)',
+    code: proposalCall(c1Pid, 'Which template family should the catalog grow next?',
+      'Advisory - rank the options.', ['vesting', 'oracle', 'marketplace'], nowT),
+    chainId: '1',
+    signers: [gasCap(SENDER00), unscoped(K.deviceA)],
+    gasLimit: 8000,
   });
-  res = await localCall(`(${T}.get-results "${pid}")`, HUB);
-  record('P8', 'transfer released the moved Borda points (arrivals stay unvoted)',
-    scoresEq(res.scores, [s0[0] + 380, s0[1] + 300, s0[2]]) && res.turnout === res0.turnout + 160,
-    JSON.stringify(res.scores).slice(0, 80));
+  const hubQ = await localCall(`(${T}.get-head-to-head "${freshPid}")`, HUB);
+  const c1Q = await localCall(`(${T}.get-head-to-head "${c1Pid}")`, '1');
+  const stamp = (q: any) => JSON.stringify([q.title, q.options, q['starts-at'], q['ends-at']]);
+  record('P8', 'a question published off-hub carries IDENTICAL parameters (chain 0 vs chain 1)',
+    stamp(hubQ) === stamp(c1Q), `hub=${stamp(hubQ).slice(0, 60)}`);
+  record('P8', 'governance is NOT hub-restricted: create-proposal succeeds on chain 1',
+    (c1Q.options as string[]).length === 3, 'enforce-hub was deleted by C2');
 
-  // re-vote REPLACES the ballot at current weight: u2 (60) switches to [2]
-  await voteSelfPaid(K.u2, [2]);
-  res = await localCall(`(${T}.get-results "${pid}")`, HUB);
-  record('P8', 're-vote replaced u2 ballot in place ([0]@60 -> [2]@60)',
-    scoresEq(res.scores, [s0[0] + 200, s0[1] + 300, s0[2] + 180]) && res.turnout === res0.turnout + 160,
-    JSON.stringify(res.scores).slice(0, 80));
+  // BALLOT COVERAGE NEEDS A QUESTION THAT IS ALREADY OPEN, and the one just
+  // created is not: the chain-local voting design C8 puts the earliest legal opening ~11h out, so
+  // no single rehearsal run can create a question and vote in it. That is what
+  // the announce floor MEANS, not a tooling gap to route around.
+  //
+  // So the vote leg is opportunistic: it uses a question left votable by an
+  // earlier run on this devnet, and when there is none (a fresh genesis) every
+  // ballot check is SKIPPED with what covers it instead. Skips are never counted
+  // as passes — see record()/skip() in env.ts.
+  const openNow: string[] = await localCall(`(${T}.open-ids)`, HUB);
+  const pid: string | null = openNow.length ? openNow[0] : null;
+  const NO_VOTE_REASON =
+    'no question is open for voting on this devnet. C8 puts the earliest legal opening ~11h '
+    + 'after authoring, so one run cannot create a question and vote in it. The question opened '
+    + 'above becomes votable in 12.5h — re-run then for on-node ballot evidence. Balloting is '
+    + 'covered meanwhile by tests/pco.repl and regressions.repl, where the clock is controlled.';
+  if (pid === null) {
+    // ONE SKIP PER HIDDEN CHECK, not one per theme. Three summary lines stood for
+    // seven real checks, so the evidence file under-reported the gap while
+    // appearing to disclose it — the exact failure the skip state exists to stop.
+    for (const name of [
+      'Borda scores: u2 [0] and u3 [1,0] tallied live',
+      'transfer released the moved Borda points (arrivals stay unvoted)',
+      're-vote replaced u2 ballot in place ([0]@60 -> [2]@60)',
+      'reserve cannot vote (on-node)',
+      'vote key: hot key ranked for the cold account',
+      'vote key: hot key CANNOT transfer',
+      'vote key: cleared key refused',
+    ]) skip('P8', name, NO_VOTE_REASON);
+  } else {
+    const res0 = await localCall(`(${T}.get-results "${pid}")`, HUB);
+    const s0: number[] = res0.scores;
+    const scoresEq = (got: number[], want: number[]) =>
+      JSON.stringify(got.map((v) => Math.round(v * 100) / 100)) === JSON.stringify(want.map((v) => Math.round(v * 100) / 100));
 
-  // reserve is barred from voting (preflight)
-  const rv = await preflight({
-    label: 'reserve vote', chainId: HUB,
-    code: `(${T}.cast-vote "${pid}" "r:${KS}" [0])`,
-    signers: [gasCap(SENDER00), unscoped(K.deviceA), unscoped(K.deviceB)],
-    gasLimit: 4000,
-  });
-  record('P8', 'reserve cannot vote (on-node)', !rv.ok && rv.error.includes('reserve cannot vote'), rv.error.slice(0, 90));
+    const voteSelfPaid = (u: Keypair, ranking: number[]) => send({
+      label: `self-paid ranked ballot [${ranking}]`,
+      code: `(${T}.cast-vote "${pid}" "${u.account}" [${ranking.join(' ')}])`,
+      chainId: HUB,
+      signers: [{ kp: u, caps: (wc) => [wc('coin.GAS'), wc(`${T}.VOTE`, pid, u.account)] }],
+      gasLimit: 3000, gasPrice: 1e-7,
+    });
+    // K=3: position p contributes weight*(3-p). u2 (100): [0] -> +300 opt0.
+    // u3 (100): [1 0] -> +300 opt1, +200 opt0.
+    await voteSelfPaid(K.u2, [0]);
+    await voteSelfPaid(K.u3, [1, 0]);
+    let res = await localCall(`(${T}.get-results "${pid}")`, HUB);
+    record('P8', 'Borda scores: u2 [0] and u3 [1,0] tallied live',
+      scoresEq(res.scores, [s0[0] + 500, s0[1] + 300, s0[2]]) && res.turnout === res0.turnout + 200,
+      JSON.stringify(res.scores).slice(0, 80));
 
-  // ---- vote key: u1 registers a HOT key (main guard signs), hot key ranks ----
-  const hot = newKey();
-  await send({
-    label: 'u1 registers a vote key (main guard, scoped VOTE-KEY-ADMIN)',
-    code: `(${T}.set-vote-key "${K.u1.account}" (read-keyset 'vk))`,
-    chainId: HUB,
-    signers: [{ kp: K.u1, caps: (wc) => [wc('coin.GAS'), wc(`${T}.VOTE-KEY-ADMIN`, K.u1.account, `k:${hot.publicKey}`)] }],
-    data: { vk: { keys: [hot.publicKey], pred: 'keys-all' } },
-    gasLimit: 2500, gasPrice: 1e-7,
-  });
-  await fundKda(hot);   // the hot key pays its own vote gas — the cold key stays cold
-  await send({
-    label: 'HOT key ranks as u1 (cold key untouched)',
-    code: `(${T}.cast-vote "${pid}" "${K.u1.account}" [2 1])`,
-    chainId: HUB, sender: hot.account,
-    signers: [{ kp: hot, caps: (wc) => [wc('coin.GAS'), wc(`${T}.VOTE`, pid, K.u1.account)] }],
-    gasLimit: 3000, gasPrice: 1e-7,
-  });
-  const u1ballot = await localCall(`(${T}.get-ballot "${pid}" "${K.u1.account}")`, HUB);
-  record('P8', 'vote key: hot key ranked for the cold account',
-    JSON.stringify((u1ballot.ranking as any[]).map((v) => (typeof v === 'object' ? v.int : v))) === JSON.stringify([2, 1]),
-    JSON.stringify(u1ballot).slice(0, 80));
-  const hotSteal = await preflight({
-    label: 'hot key tries to transfer (must fail)', chainId: HUB, sender: hot.account,
-    code: `(${T}.transfer "${K.u1.account}" "${K.u2.account}" 1.0)`,
-    signers: [{ kp: hot, caps: (wc) => [wc('coin.GAS'), wc(`${T}.TRANSFER`, K.u1.account, K.u2.account, { decimal: '1.0' })] }],
-    gasLimit: 2500, gasPrice: 1e-7,
-  });
-  record('P8', 'vote key: hot key CANNOT transfer', !hotSteal.ok && hotSteal.error.includes('Keyset failure'),
-    hotSteal.error.slice(0, 60));
-  await send({
-    label: 'u1 clears the vote key',
-    code: `(${T}.clear-vote-key "${K.u1.account}")`,
-    chainId: HUB,
-    signers: [{ kp: K.u1, caps: (wc) => [wc('coin.GAS'), wc(`${T}.VOTE-KEY-ADMIN`, K.u1.account, '')] }],
-    gasLimit: 2500, gasPrice: 1e-7,
-  });
-  const hotAfter = await preflight({
-    label: 'cleared hot key votes (must fail)', chainId: HUB, sender: hot.account,
-    code: `(${T}.cast-vote "${pid}" "${K.u1.account}" [0])`,
-    signers: [{ kp: hot, caps: (wc) => [wc('coin.GAS'), wc(`${T}.VOTE`, pid, K.u1.account)] }],
-    gasLimit: 3000, gasPrice: 1e-7,
-  });
-  record('P8', 'vote key: cleared key refused', !hotAfter.ok && hotAfter.error.includes('neither account guard nor registered vote key'),
-    hotAfter.error.slice(0, 60));
+    // live release: u2 moves 40 away -> ballot [0] sheds 40 weight = -120 points
+    await send({
+      label: 'u2 transfers 40 to u3 (ballot release)',
+      code: `(${T}.transfer "${K.u2.account}" "${K.u3.account}" 40.0)`,
+      chainId: HUB,
+      signers: [
+        gasCap(SENDER00),
+        { kp: K.u2, caps: (wc) => [wc(`${T}.TRANSFER`, K.u2.account, K.u3.account, { decimal: '40.0' })] },
+      ],
+      gasLimit: 4000,
+    });
+    res = await localCall(`(${T}.get-results "${pid}")`, HUB);
+    record('P8', 'transfer released the moved Borda points (arrivals stay unvoted)',
+      scoresEq(res.scores, [s0[0] + 380, s0[1] + 300, s0[2]]) && res.turnout === res0.turnout + 160,
+      JSON.stringify(res.scores).slice(0, 80));
+
+    // re-vote REPLACES the ballot at current weight: u2 (60) switches to [2]
+    await voteSelfPaid(K.u2, [2]);
+    res = await localCall(`(${T}.get-results "${pid}")`, HUB);
+    record('P8', 're-vote replaced u2 ballot in place ([0]@60 -> [2]@60)',
+      scoresEq(res.scores, [s0[0] + 200, s0[1] + 300, s0[2] + 180]) && res.turnout === res0.turnout + 160,
+      JSON.stringify(res.scores).slice(0, 80));
+
+    // reserve is barred from voting (preflight)
+    const rv = await preflight({
+      label: 'reserve vote', chainId: HUB,
+      code: `(${T}.cast-vote "${pid}" "r:${KS}" [0])`,
+      signers: [gasCap(SENDER00), unscoped(K.deviceA), unscoped(K.deviceB)],
+      gasLimit: 4000,
+    });
+    record('P8', 'reserve cannot vote (on-node)', !rv.ok && rv.error.includes('reserve cannot vote'), rv.error.slice(0, 90));
+
+    // ---- vote key: u1 registers a HOT key (main guard signs), hot key ranks ----
+    const hot = newKey();
+    await send({
+      label: 'u1 registers a vote key (main guard, scoped VOTE-KEY-ADMIN)',
+      code: `(${T}.set-vote-key "${K.u1.account}" (read-keyset 'vk))`,
+      chainId: HUB,
+      signers: [{ kp: K.u1, caps: (wc) => [wc('coin.GAS'), wc(`${T}.VOTE-KEY-ADMIN`, K.u1.account, `k:${hot.publicKey}`)] }],
+      data: { vk: { keys: [hot.publicKey], pred: 'keys-all' } },
+      gasLimit: 2500, gasPrice: 1e-7,
+    });
+    await fundKda(hot);   // the hot key pays its own vote gas — the cold key stays cold
+    await send({
+      label: 'HOT key ranks as u1 (cold key untouched)',
+      code: `(${T}.cast-vote "${pid}" "${K.u1.account}" [2 1])`,
+      chainId: HUB, sender: hot.account,
+      signers: [{ kp: hot, caps: (wc) => [wc('coin.GAS'), wc(`${T}.VOTE`, pid, K.u1.account)] }],
+      gasLimit: 3000, gasPrice: 1e-7,
+    });
+    const u1ballot = await localCall(`(${T}.get-ballot "${pid}" "${K.u1.account}")`, HUB);
+    record('P8', 'vote key: hot key ranked for the cold account',
+      JSON.stringify((u1ballot.ranking as any[]).map((v) => (typeof v === 'object' ? v.int : v))) === JSON.stringify([2, 1]),
+      JSON.stringify(u1ballot).slice(0, 80));
+    const hotSteal = await preflight({
+      label: 'hot key tries to transfer (must fail)', chainId: HUB, sender: hot.account,
+      code: `(${T}.transfer "${K.u1.account}" "${K.u2.account}" 1.0)`,
+      signers: [{ kp: hot, caps: (wc) => [wc('coin.GAS'), wc(`${T}.TRANSFER`, K.u1.account, K.u2.account, { decimal: '1.0' })] }],
+      gasLimit: 2500, gasPrice: 1e-7,
+    });
+    record('P8', 'vote key: hot key CANNOT transfer', !hotSteal.ok && hotSteal.error.includes('Keyset failure'),
+      hotSteal.error.slice(0, 60));
+    await send({
+      label: 'u1 clears the vote key',
+      code: `(${T}.clear-vote-key "${K.u1.account}")`,
+      chainId: HUB,
+      signers: [{ kp: K.u1, caps: (wc) => [wc('coin.GAS'), wc(`${T}.VOTE-KEY-ADMIN`, K.u1.account, '')] }],
+      gasLimit: 2500, gasPrice: 1e-7,
+    });
+    const hotAfter = await preflight({
+      label: 'cleared hot key votes (must fail)', chainId: HUB, sender: hot.account,
+      code: `(${T}.cast-vote "${pid}" "${K.u1.account}" [0])`,
+      signers: [{ kp: hot, caps: (wc) => [wc('coin.GAS'), wc(`${T}.VOTE`, pid, K.u1.account)] }],
+      gasLimit: 3000, gasPrice: 1e-7,
+    });
+    record('P8', 'vote key: cleared key refused', !hotAfter.ok && hotAfter.error.includes('neither account guard nor registered vote key'),
+      hotAfter.error.slice(0, 60));
+
+  }
 
   // ---------- P9: REAL cross-chain transfer (SPV), hub -> chain 1 ----------
   console.log('\nP9  cross-chain transfer with SPV');
@@ -569,9 +673,13 @@ async function main() {
   // u3's recorded ballot weight (100) is still <= the remaining hub balance
   // (115), so the release rule leaves the ballot UNCHANGED - weights shrink
   // only when the balance drops below the recorded weight.
-  const u3b = await localCall(`(${T}.get-ballot "${pid}" "${K.u3.account}")`, HUB);
-  record('P9', 'release rule: ballot weight untouched while balance >= recorded weight',
-    u3b.weight === 100, JSON.stringify(u3b).slice(0, 100));
+  if (pid === null) {
+    skip('P9', 'release rule: ballot weight untouched while balance >= recorded weight', NO_VOTE_REASON);
+  } else {
+    const u3b = await localCall(`(${T}.get-ballot "${pid}" "${K.u3.account}")`, HUB);
+    record('P9', 'release rule: ballot weight untouched while balance >= recorded weight',
+      u3b.weight === 100, JSON.stringify(u3b).slice(0, 100));
+  }
 
   // ---------- P10: ROTATION — the scariest op, rehearsed ×20 ----------
   console.log('\nP10 keyset rotation (C out, D in) ×20');
@@ -701,35 +809,51 @@ async function main() {
     data: { g: { keys: [K.u1.publicKey], pred: 'keys-all' } },
     gasLimit: 4000,
   });
-  await neg('proposal duration out of bounds refused', 'duration outside', {
-    label: 'bad duration', chainId: HUB,
-    code: `(${T}.create-proposal "t" "b" ["a" "b"] 5)`,
+  // The bound moved: `duration-hours` is gone, the window is [starts-at, ends-at]
+  // and must run 24h..30 days (cold audit F1 restored the floor). A 1h window is
+  // the modern form of this negative.
+  await neg('voting window shorter than 24h refused', 'at least 24h', {
+    label: 'window too short', chainId: HUB,
+    code: (() => { const st = new Date(nowT.getTime() + 12.5 * 3600_000);
+                   return `(${T}.create-proposal "short-win" "t" "b" ["a" "b"] (time "${iso(nowT)}") `
+                        + `(time "${iso(st)}") (time "${iso(new Date(st.getTime() + 3600_000))}"))`; })(),
     signers: [gasCap(SENDER00), unscoped(K.deviceA)],
     gasLimit: 4000,
   });
   await neg('holder-authored proposal refused ON-NODE (admin-authored governance)', 'governance or ops authority required', {
     label: 'holder proposer', chainId: HUB,
-    code: `(${T}.create-proposal "t" "b" ["a" "b"] 72)`,
+    code: proposalCall('holder-probe', 't', 'b', ['a', 'b'], nowT),
     signers: [gasCap(SENDER00), { kp: K.u2, caps: () => [] }],
     gasLimit: 4000,
   });
-  await neg('invalid ranking refused (duplicate entries)', 'ranking entries must be distinct', {
-    label: 'bad ranking', chainId: HUB,
-    code: `(${T}.cast-vote "${pid}" "${K.u1.account}" [0 0])`,
-    signers: [gasCap(SENDER00), u1cap(`${T}.VOTE`, pid, K.u1.account)],
-    gasLimit: 4000,
-  });
-  await neg('vote OFF-HUB refused (chain 1)', 'hub chain only', {
-    label: 'off-hub vote', chainId: '1',
-    code: `(${T}.cast-vote "${pid}" "${K.u3.account}" [0])`,
-    signers: [gasCap(SENDER00), { kp: K.u3, caps: (wc) => [wc(`${T}.VOTE`, pid, K.u3.account)] }],
-    gasLimit: 4000,
-  });
+  if (pid === null) {
+    skip('P11', 'invalid ranking refused (duplicate entries)', NO_VOTE_REASON);
+  } else {
+    await neg('invalid ranking refused (duplicate entries)', 'ranking entries must be distinct', {
+      label: 'bad ranking', chainId: HUB,
+      code: `(${T}.cast-vote "${pid}" "${K.u1.account}" [0 0])`,
+      signers: [gasCap(SENDER00), u1cap(`${T}.VOTE`, pid, K.u1.account)],
+      gasLimit: 4000,
+    });
+  }
+  // DELETED, 2026-08-14: `neg('vote OFF-HUB refused (chain 1)', 'hub chain only')`.
+  //
+  // That check asserted the OPPOSITE of the vision. the chain-local voting design C2 deleted
+  // enforce-hub precisely so a holder can vote from the chain their tokens are
+  // on, and this negative would have gone green only while the defect was
+  // present — the on-node twin of the suite's `vision-offhub-voting.repl`, which
+  // was a must-fail file for the same reason.
+  //
+  // It is removed rather than inverted here because a positive off-hub ballot
+  // needs the question to EXIST on the off-hub chain, which needs the 20-chain
+  // publish; that is proven directly below (P11b) for creation, and the ballot
+  // itself is covered by vision-offhub-voting.repl where the clock is
+  // controllable. Do not restore this negative: it pins a defect as spec.
 
   // ---- admin-cancel: accountable early close (also keeps re-runs clean) ----
   const holderCancel = await preflight({
     label: 'holder cancel (must fail)', chainId: HUB, sender: K.u1.account,
-    code: `(${T}.admin-cancel-proposal "${pid}" "nope")`,
+    code: `(${T}.admin-cancel-proposal "${freshPid}" "nope")`,
     signers: [{ kp: K.u1, caps: (wc) => [wc('coin.GAS')] }],
     gasLimit: 2500, gasPrice: 1e-7,
   });
@@ -737,7 +861,7 @@ async function main() {
     holderCancel.error.slice(0, 60));
   const noReason = await preflight({
     label: 'cancel without reason (must fail)', chainId: HUB,
-    code: `(${T}.admin-cancel-proposal "${pid}" "")`,
+    code: `(${T}.admin-cancel-proposal "${freshPid}" "")`,
     signers: [gasCap(SENDER00), unscoped(K.deviceA)],
     gasLimit: 3000,
   });
@@ -745,14 +869,14 @@ async function main() {
     noReason.error.slice(0, 60));
   await send({
     label: 'OPS cancels the question with a public reason',
-    code: `(${T}.admin-cancel-proposal "${pid}" "rehearsal question - closing after the drill")`,
+    code: `(${T}.admin-cancel-proposal "${freshPid}" "rehearsal question - closing after the drill")`,
     chainId: HUB,
     signers: [gasCap(SENDER00), unscoped(K.deviceA)],
     gasLimit: 3000,
   });
   const openAfter: string[] = await localCall(`(${T}.open-ids)`, HUB);
   record('P8', 'cancel freed the slot immediately (scores frozen)',
-    !openAfter.includes(pid), `open now: ${JSON.stringify(openAfter)}`);
+    !openAfter.includes(freshPid), `live now: ${JSON.stringify(openAfter)}`);
 
   await neg('claim OFF-HUB refused (chain 1)', 'hub chain only', {
     label: 'off-hub claim', chainId: '1',
@@ -1000,19 +1124,30 @@ async function main() {
   }, 'P13');
 
   // ---------- evidence ----------
-  const passed = checks.filter((c) => c.ok).length;
-  console.log(`\n${passed}/${checks.length} checks passed`);
+  // SKIPPED checks are counted and reported SEPARATELY. They are not passes —
+  // folding them into the total would inflate the headline number with coverage
+  // that does not exist, which is the one thing an evidence document must not do.
+  const skipped = checks.filter((c) => c.skipped);
+  const ran = checks.filter((c) => !c.skipped);
+  const passed = ran.filter((c) => c.ok).length;
+  console.log(`\n${passed}/${ran.length} checks passed` +
+    (skipped.length ? `  ·  ${skipped.length} SKIPPED (not measured here — see the evidence file)` : ''));
   const md = [
     '# Devnet dress rehearsal — evidence',
     '',
     `- Date: ${new Date().toISOString()}`,
     `- Network: recap-development (KDA-CE devnet, 20 chains), ns \`${NS}\``,
     `- Devices simulated by local softkeys A/B/C (+ spare D); 2-of-3 \`keys-2\``,
-    `- Result: **${passed}/${checks.length} checks passed**`,
+    `- Result: **${passed}/${ran.length} checks passed**` +
+      (skipped.length ? `, **${skipped.length} SKIPPED** — listed below, not counted as passes` : ''),
+    ...(skipped.length ? ['',
+      '> **What this run did NOT measure.** Every line marked SKIP names what covers',
+      '> it instead. They are excluded from the total deliberately: a skipped check',
+      '> reported as a pass is a false statement about coverage.'] : []),
     '',
     '| Phase | Check | Result | Detail |',
     '|---|---|---|---|',
-    ...checks.map((c) => `| ${c.phase} | ${c.check} | ${c.ok ? 'PASS' : 'FAIL'} | ${c.detail.replace(/\|/g, '\\|')} |`),
+    ...checks.map((c) => `| ${c.phase} | ${c.check} | ${c.skipped ? 'SKIP' : c.ok ? 'PASS' : 'FAIL'} | ${c.detail.replace(/\|/g, '\\|')} |`),
     '',
     '_Claims deliberately left OPEN on devnet for the browser-UX verification pass;_',
     '_browser evidence lives in [UX-VERIFICATION.md](UX-VERIFICATION.md) (kept out of this_',

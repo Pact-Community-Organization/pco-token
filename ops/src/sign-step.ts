@@ -11,10 +11,16 @@
 // commands across the deploy phase, and a skipped or misdirected one is invisible
 // until submit.
 //
-// This orchestrates the PINNED `ledger-signer` (tools-verified-v9) and does not
+// This orchestrates the PINNED `ledger-signer` and does not
 // modify it. Anything that touches a hardware wallet stays inside the tool covered
 // by TOOL-INTEGRITY.md; this file only decides which files it is pointed at and
 // checks its work afterwards.
+//
+// The pin TAG IS NOT NAMED HERE ON PURPOSE. This comment used to say
+// "tools-verified-v9" and was still saying it at v10, during a live mainnet
+// ceremony. A hardcoded pin name in a comment rots silently and then reassures
+// someone falsely. Resolve it instead:
+//     git tag -l 'tools-verified-*' | sort -V | tail -1
 //
 // Usage:
 //   PCO_NETWORK=mainnet01 npx tsx src/sign-step.ts 30-token --seat B
@@ -92,6 +98,17 @@ const sheetPath = `${outDir}HASHES-${prefix}.txt`;
   console.log(`  (open it beside the device; ${files.length} entries, in signing order)\n`);
 }
 
+// ------------------------------------------------------------- declared slots
+// THE TRANSACTION SAYS HOW MANY DEVICES IT NEEDS — ask it, do not assume.
+// build-tx builds the signer list as [gas softkey, device A, device B] for a
+// governance step and [gas softkey, device A] for an ops-tier one, so slot 0 is
+// never a device and slot 2 exists only on governance steps. Everything below
+// that reasons about "what is still outstanding" reads this.
+const deviceSlots = (f: string): number[] => {
+  const cmd = JSON.parse(JSON.parse(readFileSync(`${outDir}${f}`, 'utf8')).cmd);
+  return (cmd.signers as unknown[]).map((_, i) => i).filter((i) => i > 0);
+};
+
 // ---------------------------------------------------------------- TTL budget
 // THE CLOCK STARTS AT BUILD, NOT AT SIGNING. On 2026-07-31 the gas-station step
 // was built with ttl 7200 (2h), then 40 approvals plus a device swap took 126
@@ -112,11 +129,21 @@ const sheetPath = `${outDir}HASHES-${prefix}.txt`;
   // consistently faster, lower this from a measurement, never from a hope.
   const SEC_PER_APPROVAL = 170;
   const unsignedHere = files.filter((f) => !JSON.parse(readFileSync(`${outDir}${f}`, 'utf8')).sigs[slot]).length;
-  const bothSlots = files.reduce((n, f) => {
-    const s = JSON.parse(readFileSync(`${outDir}${f}`, 'utf8')).sigs;
-    return n + (s[1] ? 0 : 1) + (s[2] ? 0 : 1);
+  // COUNT THE SLOTS THE TRANSACTION ACTUALLY DECLARES. This used to count slots
+  // 1 AND 2 on every file, but build-tx signs governance steps with
+  // [gas, A, B] and OPS-TIER steps with [gas, A] alone — so on an ops step
+  // slot 2 does not exist and was counted as permanently unsigned. That
+  // inflated this budget by one approval per file (a 20-chain ops step demanded
+  // ~128 minutes of TTL instead of ~72) and could refuse a perfectly valid
+  // build. The ops-tier steps are the RECURRING ones — create-round,
+  // set-round-code, set-round-active, grant, grant-batch — so this is the path
+  // every future quest round takes.
+  const outstanding = files.reduce((n, f) => {
+    const sigs = JSON.parse(readFileSync(`${outDir}${f}`, 'utf8')).sigs;
+    return n + deviceSlots(f).filter((sl) => !sigs[sl]).length;
   }, 0);
-  const needSec = bothSlots * SEC_PER_APPROVAL + 15 * 60;   // + swap and submit
+  const anySwap = files.some((f) => deviceSlots(f).length > 1);
+  const needSec = outstanding * SEC_PER_APPROVAL + 15 * 60;   // + swap and submit
   const now = Math.floor(Date.now() / 1000);
   let minLeft = Infinity;
   for (const f of files) {
@@ -124,14 +151,14 @@ const sheetPath = `${outDir}HASHES-${prefix}.txt`;
     minLeft = Math.min(minLeft, m.creationTime + m.ttl - now);
   }
   const mm = (s: number) => `${Math.floor(s / 60)} min`;
-  console.log(`  TTL: ${mm(minLeft)} left · need ~${mm(needSec)} for ${bothSlots} remaining approval(s) + swap + submit`);
+  console.log(`  TTL: ${mm(minLeft)} left · need ~${mm(needSec)} for ${outstanding} remaining approval(s)${anySwap ? ' + swap' : ''} + submit`);
   if (minLeft <= 0) {
     die(`these transactions EXPIRED ${mm(-minLeft)} ago. Rebuild the step (build-tx) and re-sign — ` +
         `signatures cannot be reused because the hash covers creationTime.`);
   }
   if (minLeft < needSec) {
     die(`not enough TTL left: ${mm(minLeft)} remaining, ~${mm(needSec)} needed.\n` +
-        `  Signing now would waste ${bothSlots} approvals on transactions that expire before submit.\n` +
+        `  Signing now would waste ${outstanding} approvals on transactions that expire before submit.\n` +
         `  Rebuild the step first (build-tx), optionally with PCO_TTL=<seconds>.`);
   }
   if (unsignedHere === 0) console.log(`  (all ${files.length} already signed for seat ${SEAT})`);
@@ -170,7 +197,12 @@ if (onDevice !== expectedPub) {
 if (!dryRun) console.log(`  device identity CONFIRMED — the connected device is seat ${SEAT}\n`);
 
 // ---------------------------------------------------------------- sign each file
-let signed = 0, skipped = 0;
+// `previewed` is separate from `skipped` on purpose. A dry run used to add its
+// files to `skipped`, so the summary of a rehearsal over 20 UNSIGNED files read
+// "0 signed, 20 already present" — asserting the step was done when nothing had
+// been signed at all. --dry-run is the pre-ceremony rehearsal, so that is the
+// one run whose summary must not overstate.
+let signed = 0, skipped = 0, previewed = 0;
 for (const [i, f] of files.entries()) {
   const p = `${outDir}${f}`;
   const tx = JSON.parse(readFileSync(p, 'utf8')) as { cmd: string; hash: string; sigs: ({ sig: string } | null)[] };
@@ -204,7 +236,7 @@ for (const [i, f] of files.entries()) {
   console.log(`         device must show ONE of these, in full:`);
   console.log(`           base64url  ${tx.hash}`);
   console.log(`           hex        ${hexOf(tx.hash)}`);
-  if (dryRun) { skipped++; continue; }
+  if (dryRun) { previewed++; continue; }
 
   try {
     sign(['sign', p, '--path', path, '--hash', '--add', '-o', p]);
@@ -227,15 +259,23 @@ for (const [i, f] of files.entries()) {
 }
 
 // ---------------------------------------------------------------- report
-console.log(`\n  seat ${SEAT}: ${signed} signed, ${skipped} already present`);
-const remaining = files.filter((f) => {
-  const tx = JSON.parse(readFileSync(`${outDir}${f}`, 'utf8'));
-  return !tx.sigs[1] || !tx.sigs[2];
-});
-if (remaining.length === 0) {
-  console.log(`  BOTH device slots filled on all ${files.length} file(s) — ready to submit.`);
+console.log(`\n  seat ${SEAT}: ${signed} signed, ${skipped} already present` +
+            (previewed ? `, ${previewed} shown for review (dry run — nothing was signed)` : ''));
+// "Outstanding" means a slot the transaction DECLARES and does not yet hold a
+// signature for. Testing sigs[1] and sigs[2] unconditionally meant an ops-tier
+// step — which declares no slot 2 — was never "complete": it never printed
+// ready-to-submit, and it always told the operator to swap to a device the step
+// has no room for. Those are the steps every future quest round uses.
+const outstandingFor = (sl: number) => files.filter((f) =>
+  deviceSlots(f).includes(sl) && !JSON.parse(readFileSync(`${outDir}${f}`, 'utf8')).sigs[sl]).length;
+const needA = outstandingFor(1), needB = outstandingFor(2);
+if (needA + needB === 0) {
+  console.log(`  every declared device slot filled on all ${files.length} file(s) — ready to submit.`);
 } else {
-  const needA = files.filter((f) => !JSON.parse(readFileSync(`${outDir}${f}`, 'utf8')).sigs[1]).length;
-  const needB = files.filter((f) => !JSON.parse(readFileSync(`${outDir}${f}`, 'utf8')).sigs[2]).length;
-  console.log(`  still unsigned — seat A: ${needA}, seat B: ${needB}. Swap devices and re-run with the other --seat.`);
+  const otherSeat = SEAT === 'A' ? 'B' : 'A';
+  const otherNeeds = SEAT === 'A' ? needB : needA;
+  console.log(`  still unsigned — seat A: ${needA}, seat B: ${needB}.` +
+    (otherNeeds > 0
+      ? ` Swap devices and re-run with --seat ${otherSeat}.`
+      : ` Re-run with --seat ${SEAT} to finish.`));
 }

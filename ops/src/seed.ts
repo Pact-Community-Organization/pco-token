@@ -91,18 +91,36 @@ async function main() {
     ['Which docs should we prioritize first?',
       'Advisory - rank the options.', ['guides', 'reference', 'examples', 'videos']],
   ];
-  const open: string[] = await localCall(`(${T}.open-ids)`, HUB);
-  for (let i = open.length; i < 2 && i < QUESTIONS.length; i++) {
+  // the chain-local voting design: create-proposal takes an explicit id and three absolute
+  // instants, all anchored to CHAIN time (created-at must sit within +/-1h of
+  // this chain's block time, and the devnet's clock lags wall clock).
+  //
+  // THE SEEDED QUESTIONS CANNOT BE VOTED ON IMMEDIATELY. starts-at is at least
+  // 12h out by construction, so a seed run leaves the public page showing
+  // questions that are announced but not yet open. That is the correct shape —
+  // it is what a real question looks like during its announce window — and it is
+  // said here because "seed then vote in the browser" no longer works.
+  const now = new Date(String(await localCall("(at 'block-time (chain-data))", HUB)));
+  const iso = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const live: string[] = await localCall(`(${T}.live-ids)`, HUB);
+  for (let i = live.length; i < 2 && i < QUESTIONS.length; i++) {
     const [title, body, options] = QUESTIONS[i];
+    const starts = new Date(now.getTime() + 12.5 * 3600_000);
+    const ends = new Date(starts.getTime() + 336 * 3600_000);   // 14 days, inside 24h..30d
+    const pid = `seed-${i + 1}`;
     try {
       const r = await send({
         label: `question: ${title.slice(0, 30)}…`, chainId: HUB,
-        code: `(${T}.create-proposal "${title}" "${body}" [${options.map((o) => `"${o}"`).join(' ')}] 336)`,
-        signers: [gas, opsCap], gasLimit: 4000,
+        code: `(${T}.create-proposal "${pid}" "${title}" "${body}" `
+            + `[${options.map((o) => `"${o}"`).join(' ')}] `
+            + `(time "${iso(now)}") (time "${iso(starts)}") (time "${iso(ends)}"))`,
+        signers: [gas, opsCap], gasLimit: 8000,
       });
-      console.log('question opened:', (r.result as any).data);
+      console.log(`question opened: ${(r.result as any).data} — opens ${iso(starts)}`);
     } catch (e: any) {
-      if (!String(e.message).includes('too many active')) throw e;
+      const m = String(e.message);
+      // A re-run hits the one-shot id rather than the cap; both are benign here.
+      if (!m.includes('too many active') && !m.includes('Insert')) throw e;
     }
   }
   const ids: string[] = await localCall(`(${T}.open-ids)`, HUB);

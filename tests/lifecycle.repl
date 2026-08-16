@@ -155,9 +155,15 @@
 (env-keys ["device-a"])
 (env-gas 0)
 (free.pco.create-proposal
+  "1"
   "Which template family should the catalog grow next?"
   "Advisory signal for the PCO roadmap - rank the options."
-  ["vesting" "oracle" "marketplace"] 168)
+  ["vesting" "oracle" "marketplace"]
+  (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-08T12:00:00Z"))
+;; Voting opens 12h after authoring (the chain-local voting design C8), so the ballots below must
+;; sit inside the window. The gas assertions that follow are unaffected: the
+;; clock does not change what a transaction costs.
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })
 (let ((g (env-gas)))
   (print (format "GAS create-proposal: {}" [g]))
   ;; ceiling: self-paid

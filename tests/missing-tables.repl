@@ -87,8 +87,10 @@
 (begin-tx "P1c: governance can still author a question (pco.PROPOSAL-OPS)")
 (env-keys ["ledger-a", "ledger-b"])
 (expect "the governance pair still opens a ranked-choice question" "1"
-  (nops.pco.create-proposal "still in control?" "body" ["a" "b"] 72))
+  (nops.pco.create-proposal "1" "still in control?" "body" ["a" "b"] (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-04T12:00:00Z")))
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })  ; past the announce window
 (commit-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })  ; past the 12h announce window (the chain-local voting design C8)
 
 (begin-tx "P1d: governance can still create a round (pco-claim.OPS)")
 (env-keys ["ledger-a", "ledger-b"])
@@ -141,8 +143,11 @@
 (load "fixtures/missing-vote-delegates-pco.pact")
 (novd.pco.init-mint
   [ { "account": "whale", "guard": (read-keyset 'whale), "amount": 1000000.0 } ])
-(novd.pco.create-proposal "can anyone vote?" "body" ["a" "b"] 72)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T00:00:00Z") })  ; back to authoring time: created-at must sit within CREATED-SKEW of this chain's clock
+(novd.pco.create-proposal "1" "can anyone vote?" "body" ["a" "b"] (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-04T12:00:00Z"))
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })  ; past the announce window
 (commit-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })  ; past the 12h announce window (the chain-local voting design C8)
 
 (begin-tx "P2a: the vote-key read really is unavailable on this chain")
 (expect-failure "get-vote-key cannot read a table that was never created"

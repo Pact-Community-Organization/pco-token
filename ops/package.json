@@ -10,6 +10,8 @@
     "local": "tsx src/local.ts",
     "station-status": "tsx src/station-status.ts",
     "distinct-voters": "tsx src/distinct-voters.ts",
+    "verify-proposal": "tsx src/verify-proposal.ts",
+    "combine-votes": "tsx src/combine-votes.ts",
     "fund": "tsx src/fund.ts",
     "seed": "tsx src/seed.ts",
     "events": "tsx src/event-ops.ts",

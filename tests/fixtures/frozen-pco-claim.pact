@@ -1,65 +1,26 @@
-;; pco-claim.pact — open, permissionless claim of the PCO community token,
-;; organized in ROUNDS, plus judged recognition GRANTS.
-;;
-;; A ROUND is a self-serve claim event: anyone may claim the round's fixed
-;; amount ONCE PER ACCOUNT PER ROUND, on the hub chain, inside the round's
-;; time window, while the round's budget lasts, by presenting the round's
-;; engagement code (published through PCO community channels; only its
-;; BLAKE2b hash lives on-chain). There is NO recipient list: eligibility =
-;; knowing the current code + a principal account. Rounds expire in-contract
-;; at their announced close time; unclaimed budget never leaves the pool.
-;;
-;; A GRANT is a judged award (contribution bounties, retroactive builder
-;; recognition, community micro-recognition): ops-signed, bounded per grant,
-;; with a public reason string in the AWARDED event (e.g. the PR URL).
-;;
-;; Deliberate property — a claim needs NO signature from the claimer:
-;; nothing of the claimer's is at risk (the account may not even exist
-;; yet), tokens can only land in the account canonically bound to the
-;; supplied guard (validate-principal), and a third party "claiming for
-;; you" is a gift that consumes the slot exactly as your own claim would.
-;; Requiring a signature would add envelope complexity and no security.
-;; Sybil claiming (one person, many keys) is accepted by design: the token
-;; is valueless and the on-chain invariants are one-claim-per-account-per-
-;; round and the round budget — never per-person enforcement, and never
-;; code secrecy (the code travels in claim tx code, so it is public chain
-;; data as soon as the first claim lands; budgets are the real bound).
+;; pco-claim.pact — open, permissionless claim of the PCO community token:
+;; self-serve ROUNDS (fixed amount once per account per round, hub chain,
+;; time window, budget, engagement-code hash gate) plus judged recognition
+;; GRANTS. A claim needs NO claimer signature: tokens can only land in the
+;; account bound to the supplied guard, and a third-party claim is a gift
+;; that consumes the slot. Codes are engagement, never security - public
+;; chain data after the first claim; budgets and one-claim-per-account-per-
+;; round are the invariants (Sybil claiming is accepted by design).
 (namespace (read-msg 'ns))
 
 (module pco-claim GOVERNANCE
 
-  @doc "Claim distributor for the PCO community token: module-guarded      \
-  \pool escrow; self-serve claim ROUNDS (fixed amount, fixed budget, time  \
-  \window, engagement-code gate, one claim per account per round); judged  \
-  \GRANTS with public reasons; master open/close switch; hub-chain only.   \
-  \After the program ends (master switch closed), the community keyset may \
-  \sweep the undistributed pool remainder to the community reserve (public \
-  \SWEPT event).                                                           \
-  \                                                                        \
-  \Two privilege tiers, split by what a compromised key could do:          \
-  \  * HIGH-CRITICAL (2-of-3 <ns>.pco-gov): module upgrade (GOVERNANCE)    \
-  \    and the pool sweep (ADMIN) - the one path that redirects the whole  \
-  \    pool remainder to an arbitrary receiver.                            \
-  \  * ROUTINE OPS (OPS cap -> the guard in pco.ops-auth, which governance \
-  \    names and can re-point at any time; governance itself always        \
-  \    satisfies OPS): round creation and management (create-round /       \
-  \    set-round-active / set-round-code),                                 \
-  \    grants, and the master open/close switch. The ops key is the DRIP   \
-  \    THROTTLE, not a vault key: every COMMITMENT it can make is bounded  \
-  \    per object (round amount <= MAX-ROUND-AMOUNT, round budget <=      \
-  \    MAX-ROUND-BUDGET, grant <= MAX-GRANT) and per day (create-round     \
-  \    budgets + grants charge a daily ops meter, OPS-EPOCH-CAP, that      \
-  \    fails closed and self-heals next epoch). A lone compromised ops     \
-  \    key can at worst commit OPS-EPOCH-CAP per epoch (2x across one      \
-  \    epoch boundary) in bounded, publicly evented objects, or hold       \
-  \    claiming closed (kill-switch DoS). Every                            \
-  \    such act is visible via ROUND-CREATED/ROUND-SET/CODE-SET/OPEN-SET/  \
-  \    AWARDED events; governance can always close and sweep through its   \
-  \    OPS/ADMIN authority, and the definitive revocation is instant and   \
-  \    upgrade-free: governance calls (pco.set-ops-guard) to name a new    \
-  \    ops authority - available even after a module freeze. The           \
-  \    governance keyset always satisfies OPS too (strictly stronger), so  \
-  \    a lost ops key never strands operation."
+  @doc "Claim distributor for the PCO community token: module-guarded pool  \
+  \escrow; self-serve claim ROUNDS; judged GRANTS with public reasons;      \
+  \master open/close switch; hub-chain only; after close the community      \
+  \keyset may sweep the pool remainder to the reserve (public SWEPT event). \
+  \Two privilege tiers: the 2-of-3 governance keyset holds upgrade and the  \
+  \sweep, while ROUTINE OPS (the guard in pco.ops-auth, which governance    \
+  \names and always satisfies itself) runs rounds, grants and the switch -  \
+  \a drip throttle, not a vault key: every commitment is bounded per object \
+  \and per epoch (OPS-EPOCH-CAP, fails closed), every act is publicly       \
+  \evented, and governance revokes ops instantly via pco.set-ops-guard,     \
+  \available even after a module freeze."
 
   ;; -----------------------------
   ;; Governance
@@ -78,14 +39,11 @@
     "Set true and redeploy to permanently freeze upgrades.")
 
   (defconst FREEZE-RESIDUE-TOLERANCE:decimal 1.0
-    "Pool residue the freeze interlock tolerates. The interlock exists to stop \
-    \a freeze while the pool is FUNDED - the ~900,000 undistributed community  \
-    \tokens, which a freeze before the sweep would strand. A trace balance is  \
-    \not that, and the pool account is a public address that anyone may send   \
-    \to, so the check is a threshold rather than an equality: an irreversible  \
-    \ceremony must not depend on the balance being exactly zero at the moment  \
-    \it runs. Residue below this stays recoverable after the freeze, because   \
-    \`sweep-pool` is ADMIN-gated rather than gated on the upgrade capability.")
+    "Pool residue the freeze interlock tolerates. The interlock stops a       \
+    \freeze while the pool is FUNDED; anyone may send to the public pool     \
+    \address, so the check is a threshold, not an equality. Residue below    \
+    \this stays recoverable after the freeze - `sweep-pool` is ADMIN-gated,  \
+    \not gated on the upgrade capability.")
 
   (defcap GOVERNANCE ()
     @doc "Upgrade gate: the community keyset, unless frozen."
@@ -99,20 +57,14 @@
 
   (defcap OPS ()
     @doc "Routine claim operations (rounds, grants, open/close): the ops    \
-         \authority named by governance in `pco` (ONE value governs the    \
-         \routine tier for both modules, so a single set-ops-guard call    \
-         \rotates ops everywhere), with the 2-of-3 governance keyset as an \
-         \always-available fallback tried FIRST - strictly stronger, and   \
-         \it means a broken or hostile ops authority can never lock        \
-         \governance out. Scoped-signature friendly."
-    ;; BRANCH ORDER IS LOAD-BEARING - do not "tidy" it back. Same reasoning as
-    ;; pco.PROPOSAL-OPS, and the same measured failure: the ops branch reads
-    ;; `pco.ops-auth`, a missing TABLE raises a database error, and that error
-    ;; is contained by neither `try` nor `enforce-one`. Hoisting the read into a
-    ;; `let` above the enforce-one - which is what this cap used to do - ran it
-    ;; before EITHER branch and locked the governance keyset out of create-round,
-    ;; grant, grant-batch and set-open on any chain missing that table, with no
-    ;; on-chain repair because set-ops-guard writes to it too.
+         \authority named by governance in `pco` (one set-ops-guard call    \
+         \rotates ops for both modules), with the 2-of-3 governance keyset  \
+         \as an always-available fallback tried FIRST, so a broken or       \
+         \hostile ops authority can never lock governance out."
+    ;; BRANCH ORDER IS LOAD-BEARING - admin first, do not "tidy" it back.
+    ;; The ops branch reads `pco.ops-auth`; on a chain missing that table the
+    ;; read raises a database error, which neither `try` nor `enforce-one`
+    ;; contains - same shape as pco.PROPOSAL-OPS.
     (enforce-one "ops authorization failed: neither the ops authority nor the governance keyset is satisfied"
       [ (enforce-keyset ADMIN-KS)
         (enforce-guard (pco.ops-guard)) ]))
@@ -133,15 +85,10 @@
 
   (defconst OPS-EPOCH-CAP:decimal 40000.0
     "Total PCO the ops tier may COMMIT per epoch across round budgets and  \
-    \grants (charged at create-round/grant time, worst-case). Fails closed,\
-    \self-heals next epoch. Honest bound (audit INFO): per EPOCH, not per  \
-    \sliding day - a key can commit up to 2x the cap inside one 24h window \
-    \straddling an epoch boundary; the sustained rate is cap/day and every \
-    \commitment is publicly evented. It is a rate limit, NOT a pool-       \
-    \solvency guarantee: cumulative commitments are not reconciled against \
-    \the pool balance (an over-committed round simply fails late claims    \
-    \with insufficient funds, atomically). Sized to admit the genesis      \
-    \round (30k) plus slack in one epoch.")
+    \grants; fails closed, self-heals next epoch. Per EPOCH, not per       \
+    \sliding day (up to 2x across one boundary), and a rate limit, NOT a   \
+    \pool-solvency guarantee: an over-committed round simply fails late    \
+    \claims with insufficient funds, atomically.")
 
   (defconst EPOCH-LEN 86400
     "Ops-meter epoch length in seconds (1 day).")
@@ -158,31 +105,20 @@
   ;; -----------------------------
 
   (defun pool-guard:guard ()
-    @doc "The guard of the claim pool account: a MODULE GUARD of pco-claim. \
-         \The pool is spendable only when this module's own code is on the call \
-         \stack (claim / grant / sweep-pool), or by acquiring pco-claim's module \
-         \admin (its governance keyset). This ties every pool spend to a genuine \
-         \in-module operation, so no other module or bare transaction can move \
-         \pool funds. \
-         \NEVER RENAME this module: the pool account principal derives from this \
-         \guard, and this guard names the module - a rename strands the pool."
+    @doc "The guard of the claim pool account: a MODULE GUARD of pco-claim,  \
+         \spendable only with this module's own code on the call stack       \
+         \(claim / grant / sweep-pool) or under its module admin. NEVER      \
+         \RENAME this module or the guard string: the pool account principal \
+         \derives from both - a rename strands the pool."
     (create-module-guard "pco-claim-pool"))
 
   (defconst POOL-ACCOUNT:string (create-principal (pool-guard))
     "The claim pool: an m: (MODULE-GUARD) principal account in the pco token, \
     \credited by init-mint, debitable only through this module's            \
-    \claim/grant/sweep paths.                                               \
-    \                                                                       \
-    \WHAT KEEPS THESE ~900,000 TOKENS OUT OF THE TALLY is the by-NAME        \
-    \non-voting register in `pco`, written by this module's own deploy       \
-    \footer - one row, and removable by governance. It is NOT the `m:` tag.  \
-    \An earlier version of this docstring said pco bars contract-controlled  \
-    \principals from voting; that principal-TYPE rule was deliberately       \
-    \removed (it would also disenfranchise participants who legitimately     \
-    \hold through a contract), so relying on the tag would leave the pool    \
-    \voting. If this module is ever redeployed on a chain where that footer  \
-    \does not re-register the pool, the exclusion is gone - verify           \
-    \`(pco.non-voting? (pool-account))` on a live deploy, not the prefix.")
+    \claim/grant/sweep paths. What keeps the pool out of the tally is the   \
+    \by-NAME non-voting register in `pco`, written by this module's own     \
+    \deploy footer - NOT the `m:` tag: verify                               \
+    \`(pco.non-voting? (pool-account))` on a live deploy, never the prefix.")
 
   ;; -----------------------------
   ;; State
@@ -225,20 +161,15 @@
   ;; Events
   ;; -----------------------------
 
-  ;; Every event capability carries a real body. An @event cap authorizes
-  ;; nothing, but a body that asserts nothing makes the event meaningless - and
-  ;; this program publishes participation numbers. House rule: every event cap
-  ;; requires the capability that authorized the real action. CLAIMED is emitted
-  ;; on the deliberately permissionless claim path where no capability is held,
-  ;; so it instead requires the claim ROW to exist with a matching amount. That
-  ;; row is written by `claim` and by nothing else.
+  ;; Every event capability carries a real body: each requires the capability
+  ;; that authorized the real action. CLAIMED is emitted on the permissionless
+  ;; claim path where no capability is held, so it instead requires the claim
+  ;; ROW to exist with a matching amount - written by `claim` and nothing else.
 
   (defcap CLAIMED (round-id:string account:string amount:decimal)
     @event
-    ;; HONEST LIMIT: a CLAIMED event cannot be invented - there is no row to read
-    ;; without a real claim, and a mismatched amount is rejected - but it CAN be
-    ;; restated. Participation figures must therefore count DISTINCT ACCOUNTS in
-    ;; the claims table, never CLAIMED events.
+    ;; A CLAIMED event cannot be invented, but it CAN be restated: count
+    ;; participation from DISTINCT ACCOUNTS in the claims table, never events.
     (with-read claims (claim-key round-id account) { "amount" := a }
       (enforce (= a amount) "claimed amount does not match the recorded claim")))
 
@@ -285,19 +216,13 @@
   (defun charge-ops-meter:bool (amount:decimal)
     @doc "Charge an ops COMMITMENT against the daily cap; roll the epoch on  \
          \block-time; fail closed at the cap. Callable only inside an        \
-         \acquired OPS capability.                                           \
-         \Exactly two callers: create-round (the budget) and grant-internal  \
-         \(the award). Nothing else charges it - notably rotating a round's  \
-         \code does not, which is why that is forbidden outright once a      \
-         \round has claims rather than metered.                              \
-         \WHAT THIS BOUNDS: commitment, not outflow. A budget committed in   \
-         \one epoch is claimable in later epochs, so same-day extraction can \
-         \exceed OPS-EPOCH-CAP. It is a rate limit on new obligations, and   \
-         \never a solvency guarantee."
+         \acquired OPS capability; exactly two callers - create-round (the   \
+         \budget) and grant-internal (the award). Bounds commitment, not     \
+         \outflow: a rate limit on new obligations, never a solvency         \
+         \guarantee."
     (require-capability (OPS))
-    ;; Self-defending: a negative charge would CREDIT the meter and unbound the
-    ;; day's spend. OPS has a real body so this is not reachable by an outsider,
-    ;; but a public function must never trust its callers.
+    ;; Self-defending: a negative charge would CREDIT the meter. A public
+    ;; function must never trust its callers.
     (enforce (>= amount 0.0) "meter charge must not be negative")
     (let ((now (at 'block-time (chain-data))))
       (with-read ops-meter METER-KEY { "epoch-start" := es, "spent" := sp }
@@ -352,23 +277,12 @@
       (if active "round activated" "round deactivated")))
 
   (defun set-round-code:string (round-id:string code-hash:string)
-    @doc "OPS: rotate a round's engagement code, allowed ONLY while the     \
-         \round has had no claims yet (hash computed off-chain).            \
-         \                                                                  \
-         \WHY THE no-claims CONDITION. Re-pointing the code hands a round's \
-         \REMAINING budget to whoever knows the new code. Before the first  \
-         \claim that is only legitimate incident response - a code leaked   \
-         \before anyone used it - and it grants ops nothing it did not      \
-         \already have, since it could have opened the round with the new   \
-         \code to begin with. AFTER claims have started it is a different   \
-         \act: it takes budget the community is already drawing on and      \
-         \redirects it to accounts of ops' choosing. The daily ops meter    \
-         \does NOT bound that, and cannot: create-round charged this budget \
-         \on the day it was opened, so extracting it later is unmetered     \
-         \spend against an old commitment. Freezing the code at the first   \
-         \claim closes the redirect outright. If a live round's code must   \
-         \genuinely change, deactivate it and open a new round - which      \
-         \meters its own budget on the day it is opened."
+    @doc "OPS: rotate a round's engagement code (hash computed off-chain),  \
+         \allowed ONLY while the round has no claims yet. Re-pointing the   \
+         \code hands the round's remaining budget to whoever knows the new  \
+         \code, and the ops meter cannot bound it (the budget was charged   \
+         \at create-round) - so once claims exist the redirect is refused   \
+         \outright; deactivate the round and open a new one instead."
     (with-capability (OPS)
       (enforce (!= "" code-hash) "empty code hash")
       (with-read rounds round-id
@@ -404,9 +318,8 @@
     @doc "Per-grant checks + payout. Internal: callable only inside an     \
          \acquired OPS capability. Kept separate from the OPS acquisition  \
          \because installing a managed capability in code poisons ALL      \
-         \later keyset enforcement in the same tx (scoped and unscoped     \
-         \sigs alike; REPL-verified 5.4) - so a batch must acquire OPS     \
-         \ONCE and never re-enforce after the first install."
+         \later keyset enforcement in the same tx - a batch must acquire   \
+         \OPS ONCE and never re-enforce after the first install."
     (require-capability (OPS))
     (let ((chain (at 'chain-id (chain-data))))
       (enforce (= chain GOV-CHAIN) "grants live on the hub chain only"))
@@ -551,46 +464,21 @@
 
 
 
-;; NEVER FREEZE THIS MODULE WHILE THE POOL HOLDS TOKENS.
-;;
-;; This module CALLS pco (get-balance, transfer-create, precision), and a
-;; dependent runs the PINNED copy of its dependency. That pinned copy dies the
-;; moment it touches the database unless the newer pco blesses the old hash -
-;; measured: "Execution aborted, hash not blessed for module <ns>.pco".
-;;
-;; Compose that with a freeze and the pool is GONE: freeze this module while it
-;; holds ~900,000 PCO, then upgrade pco without blessing, and pool-balance,
-;; grant, claim AND sweep-pool - the documented recovery path - all die. A frozen
-;; module cannot be redeployed to re-pin, so there is no on-chain recovery and no
-;; key or quorum that helps. The tokens stay visible in pco.accounts and
-;; unspendable forever.
-;;
-;; pco-gas-station carries a hard footer enforce against its own freeze for
-;; exactly this class of hazard, over a 1 KDA float. This module guards 900,000
-;; PCO and had only a prose warning. The freeze is now refused unless the pool is
-;; empty - which is the precondition the runbook's sanctioned freeze order
-;; already states: close claiming, sweep, freeze pco, re-pin, freeze this.
+;; NEVER FREEZE THIS MODULE WHILE THE POOL HOLDS TOKENS. This module CALLS pco,
+;; and a dependent runs the PINNED copy of its dependency: freeze this module,
+;; then upgrade pco without blessing the pinned hash, and pool-balance, grant,
+;; claim AND sweep-pool all die with no on-chain recovery - the pool stays
+;; visible and unspendable forever. The enforce below refuses the freeze while
+;; the pool is funded (sanctioned order: close claiming, sweep, freeze pco,
+;; re-pin, freeze this).
 ;;
 ;; OUTSIDE the `if` deliberately: the fresh branch does not run on an upgrade
-;; deploy, and a frozen UPGRADE is the only way this could realistically ship.
-;; TWO corrections to the first version of this interlock, both measured:
-;;
-;; 1. It used `pco.get-balance`, which RAISES on a missing row. The pool row is
-;;    written by the mint, and the mint is hub-only - so on 19 of 20 chains the
-;;    freeze deploy aborted with "No value found in table ... pco_accounts",
-;;    refusing the freeze because the pool was EMPTY. `get-balance-default`
-;;    reads the same row and returns 0.0 when it does not exist.
-;;
-;; 2. `= 0.0` required the balance to be EXACTLY zero at the moment the freeze
-;;    deploy ran. The pool is a public address anyone may send to, so that made
-;;    an irreversible ceremony depend on a condition the operator does not
-;;    control. The hazard this interlock exists for is a FUNDED pool - the
-;;    ~900,000 that would strand if the code were frozen before the sweep - so
-;;    a threshold expresses it and an equality does not. Residue stays
-;;    recoverable: `sweep-pool` is ADMIN-gated rather than gated on the upgrade
-;;    capability, so it still works after the freeze.
-;;
-;; `or` is BINARY in Pact 5.4 - a third branch must nest.
+;; deploy, and a frozen UPGRADE is the only realistic way the flip ships.
+;; `get-balance-default`, not `get-balance`: the pool row exists on the hub
+;; only, and a missing row must read as empty rather than abort the freeze on
+;; 19 chains. A THRESHOLD, not `= 0.0`: anyone may send to the public pool
+;; address, and residue below the tolerance stays recoverable (`sweep-pool` is
+;; ADMIN-gated, not upgrade-gated). `or` is BINARY in Pact 5.4.
 (enforce (or (not pco-claim.FROZEN-MODULE)
              (<= (pco.get-balance-default pco-claim.POOL-ACCOUNT)
                  pco-claim.FREEZE-RESIDUE-TOLERANCE))
@@ -607,12 +495,9 @@
     (create-table ops-meter)
     (insert config "config" { "open": false })
     (insert ops-meter "meter" { "epoch-start": (time "1970-01-01T00:00:00Z"), "spent": 0.0 })
-    ;; Register this module's own escrow with the token as OUTSIDE THE FLOAT.
-    ;; The pool holds undistributed community tokens, so it carries no voice.
-    ;; Done HERE, at the owner's deploy, rather than as a ceremony step: the
-    ;; exclusion then travels with the escrow and cannot be forgotten. It also
-    ;; runs in the direction the dependency already goes - this module depends
-    ;; on `pco`, so it can name the pool to `pco`, while `pco` naming this
-    ;; module would be circular.
+    ;; Register this module's own escrow with the token as OUTSIDE THE FLOAT,
+    ;; here at the owner's deploy so the exclusion travels with the escrow -
+    ;; and in the direction the dependency already goes (this module depends
+    ;; on `pco`; `pco` naming this module would be circular).
     (pco.register-non-voting POOL-ACCOUNT
       "pco-claim pool escrow: undistributed community tokens, outside the float") ])

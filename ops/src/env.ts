@@ -161,10 +161,26 @@ export async function xchain(o: {
 }
 
 // Evidence recorder — becomes the devnet-rehearsal evidence document.
-export type Check = { phase: string; check: string; ok: boolean; detail: string };
+//
+// THREE STATES, not two. A check that did not RUN is neither a pass nor a
+// failure, and recording it as either is a false statement in an evidence
+// document: as a pass it claims coverage that does not exist, as a failure it
+// cries wolf until someone stops reading the output. `skip` is counted and
+// printed separately and never enters the passed total.
+//
+// This exists because the chain-local voting design C8 made some on-node coverage unobtainable in
+// a single session — a question cannot be voted on until 12h after it is
+// authored — and the honest report of that is "not measured here, measured
+// there", not a silent omission.
+export type Check = { phase: string; check: string; ok: boolean; detail: string; skipped?: boolean };
 export const checks: Check[] = [];
 export function record(phase: string, check: string, ok: boolean, detail = '') {
   checks.push({ phase, check, ok, detail });
   console.log(`  ${ok ? '✓' : '✗ FAIL'} [${phase}] ${check}${detail ? ` — ${detail}` : ''}`);
   if (!ok) process.exitCode = 1;
+}
+/** Record a check that could NOT be run here. `why` must name what covers it instead. */
+export function skip(phase: string, check: string, why: string) {
+  checks.push({ phase, check, ok: false, detail: why, skipped: true });
+  console.log(`  ⊘ SKIP [${phase}] ${check} — ${why}`);
 }

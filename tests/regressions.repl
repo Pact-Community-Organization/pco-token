@@ -95,8 +95,10 @@
 (env-data { "ns": "free" })
 (env-keys ["ledger-a"])
 (env-sigs [{ "key": "ledger-a", "caps": [] }])
-(free.pco.create-proposal "R2" "regression" ["a" "b"] 720)
+(free.pco.create-proposal "1" "R2" "regression" ["a" "b"]
+  (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-31T12:00:00Z"))
 (commit-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })  ; inside the voting window
 
 (begin-tx "R2: alice votes 1000 on option 0 (K=2 -> 2000 points)")
 (env-keys ["alice-key"]) (env-sigs [{ "key": "alice-key", "caps": [] }])
@@ -164,9 +166,10 @@
 (expect-failure
   "R4 proposal bodies over 2000 characters must be refused"
   "body <= 2000 chars"
-  (free.pco.create-proposal "R4"
+  (free.pco.create-proposal "R4" "R4"
     (fold (lambda (a:string i:integer) (+ a "y")) "" (enumerate 1 2001))
-    ["a" "b"] 720))
+    ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-08-05T00:00:01Z")))
 (rollback-tx)
 
 ;; ---------------------------------------------------------------------------
@@ -274,6 +277,147 @@
 (free.pco.set-vote-key "alice" (read-keyset 'intended-vk))
 (expect "R6b the vote key the user approved is the one registered" true
   (at 'active (free.pco.get-vote-key "alice")))
+(rollback-tx)
+
+;; ---------------------------------------------------------------------------
+;; R7 — releasing must shrink a ballot to its EXCESS, never by the amount moved.
+;;
+;;      HONEST SCOPE, because a test that claims more than it proves is worse
+;;      than none. Unlike R1-R6 this block does NOT kill a demonstrated mutant.
+;;      The buggy formula is UNCONSTRUCTIBLE in PCO's code shape: release-votes
+;;      takes no amount argument, so it cannot subtract one. Measured attempt:
+;;      widening the guard to (!= w bal), which makes the excess negative and
+;;      INFLATES a ballot, does abort the suite — but at regressions.repl:246,
+;;      inside R5, before R7 is reached. So the suite kills that mutant and R7
+;;      is not what kills it.
+;;
+;;      What R7 is therefore FOR: it pins the three behaviours a future edit
+;;      could plausibly break while staying crash-free — a gift must not inflate
+;;      a vote, returning one must not deflate it, and a genuine reduction must
+;;      still shrink it. It is the executable statement of the rule, sited in the
+;;      region no other test covers, not a mutation kill.
+;;
+;;      THIS IS A SHIPPED BUG IN A SIBLING TOKEN, not a hypothetical. SPT carried
+;;      exactly that formula until 2026-08-09: a transfer reduced your vote by the
+;;      amount you MOVED regardless of what you still HELD, so returning an
+;;      unwanted gift destroyed part of a vote you fully backed — and it did that
+;;      for every open proposal you had voted on. Anyone can push tokens at you
+;;      without asking, so it was remotely triggerable against any voter.
+;;
+;;      WHY THE EXISTING COVERAGE CANNOT CATCH IT. R2 votes a FULL balance and
+;;      then moves part of it away — the one case where both formulas agree
+;;      (excess 400 == amount 400). A mutation to the buggy shape therefore
+;;      survives R2 and every other file. The formulas only diverge when the
+;;      balance is ABOVE the recorded weight, which is precisely what receiving a
+;;      gift after voting produces. That is the region asserted here.
+;; ---------------------------------------------------------------------------
+(begin-tx "R7 setup: fund a fresh voter and a gifter from the reserve")
+(env-data { "carol": { "keys": ["carol-key"], "pred": "keys-all" }
+          , "dave":  { "keys": ["dave-key"],  "pred": "keys-all" } })
+(env-keys ["ledger-a", "ledger-b"])
+(env-sigs
+  [ { "key": "ledger-a", "caps": [(free.pco.TRANSFER "r:free.pco-gov" "carol" 1000.0)
+                                 ,(free.pco.TRANSFER "r:free.pco-gov" "dave" 500.0)] }
+  , { "key": "ledger-b", "caps": [(free.pco.TRANSFER "r:free.pco-gov" "carol" 1000.0)
+                                 ,(free.pco.TRANSFER "r:free.pco-gov" "dave" 500.0)] } ])
+(free.pco.transfer-create "r:free.pco-gov" "carol" (read-keyset 'carol) 1000.0)
+(free.pco.transfer-create "r:free.pco-gov" "dave"  (read-keyset 'dave)  500.0)
+(commit-tx)
+
+(begin-tx "R7: ops opens a question and carol votes her whole balance")
+(env-data { "ns": "free" })
+(env-keys ["ledger-a"]) (env-sigs [{ "key": "ledger-a", "caps": [] }])
+;; Pin the id rather than assume it: if a future edit adds a proposal earlier in
+;; this file, this assertion fails loudly instead of R7 silently testing the
+;; wrong row. (R4's create is an expect-failure inside a rollback, so it makes none.)
+(expect "R7 is proposal 2" "2"
+  (free.pco.create-proposal "2" "R7" "gift-return regression" ["a" "b"]
+    (time "2026-08-01T12:00:01Z") (time "2026-08-02T00:00:01Z") (time "2026-09-01T00:00:01Z")))
+(commit-tx)
+;; R7 votes, so it must sit inside its own window. R2's question above is still
+;; open at this instant too, which is what makes the release assertions below
+;; meaningful: release-votes only walks questions that are open RIGHT NOW.
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-02T00:00:02Z") })
+(begin-tx "R7: inside the voting window")
+(commit-tx)
+
+(begin-tx "R7: carol votes 1000 on option 0")
+(env-keys ["carol-key"]) (env-sigs [{ "key": "carol-key", "caps": [] }])
+(free.pco.cast-vote "2" "carol" [0])
+(commit-tx)
+(expect "R7 carol's ballot carries her full balance" 1000.0
+  (at 'weight (free.pco.get-ballot "2" "carol")))
+
+;; An unsolicited gift. Carol's BALANCE rises; her recorded WEIGHT does not —
+;; the contract deliberately never raises a ballot on its own (buying more does
+;; not increase your vote unless you vote again). Balance is now ABOVE weight,
+;; which is the region where the two formulas part company.
+(begin-tx "R7: dave pushes 500 at carol, unasked")
+(env-sigs [{ "key": "dave-key", "caps": [(free.pco.TRANSFER "dave" "carol" 500.0)] }])
+(free.pco.transfer "dave" "carol" 500.0)
+(commit-tx)
+(expect "R7 the gift raises the balance" 1500.0 (free.pco.get-balance "carol"))
+(expect "R7 but NOT the recorded vote" 1000.0
+  (at 'weight (free.pco.get-ballot "2" "carol")))
+
+;; Carol returns the gift. She still holds the full 1000 she voted, so her vote
+;; must be untouched. Under the buggy shape it would drop to 500.
+(begin-tx "R7: carol returns the gift she never asked for")
+(env-sigs [{ "key": "carol-key", "caps": [(free.pco.TRANSFER "carol" "dave" 500.0)] }])
+(free.pco.transfer "carol" "dave" 500.0)
+(commit-tx)
+
+(expect "R7 carol is back to the balance she voted" 1000.0 (free.pco.get-balance "carol"))
+(expect "R7 RETURNING A GIFT MUST NOT COST HER ANY VOTE" 1000.0
+  (at 'weight (free.pco.get-ballot "2" "carol")))
+(expect "R7 and the tally is untouched" [2000.0 0.0]
+  (at 'scores (free.pco.get-results "2")))
+(expect "R7 turnout is untouched" 1000.0
+  (at 'turnout (free.pco.get-results "2")))
+
+;; The other half of the same rule: a genuine reduction below the voted weight
+;; MUST still shrink the ballot, so the assertions above cannot be satisfied by a
+;; release that simply does nothing.
+(begin-tx "R7: carol now genuinely spends 300 of what she voted")
+(env-sigs [{ "key": "carol-key", "caps": [(free.pco.TRANSFER "carol" "dave" 300.0)] }])
+(free.pco.transfer "carol" "dave" 300.0)
+(commit-tx)
+(expect "R7 a real reduction DOES shrink the ballot to the remaining balance" 700.0
+  (at 'weight (free.pco.get-ballot "2" "carol")))
+
+;; ---------------------------------------------------------------------------
+;; F3 (cold audit, 2026-08-14): AN UPGRADE CANNOT RESTATE THE TOKEN.
+;;
+;; symbol / precision / total-supply used to be read from the transaction data
+;; block by `defconst`, which is evaluated on EVERY module load — and an upgrade
+;; is a module load. Nothing pinned them to the deployed value, so an upgrade
+;; carrying `precision: 2` redefined the token: `enforce-unit` then rejected
+;; every amount finer than 0.01, and each sub-0.01 balance became permanently
+;; unspendable. THE FREEZE IS AN UPGRADE, so the one deploy that can never be
+;; repeated was also the one that could do this irreversibly.
+;;
+;; They are literals now, so a hostile data block is inert. This test feeds
+;; exactly the auditor's payload and asserts the values did NOT move — it goes
+;; red if anyone turns them back into deploy parameters.
+;; ---------------------------------------------------------------------------
+(begin-tx "F3: an upgrade carrying hostile constants cannot restate the token")
+(env-data { "ns": "free", "upgrade": true
+          , "symbol": "WRONG", "precision": 2, "total-supply": 42.0 })
+(env-keys ["ledger-a", "ledger-b"])
+(namespace "free")
+(load "../contracts/pco.pact")
+(commit-tx)
+
+(expect "precision is UNCHANGED by a hostile upgrade" 12 (free.pco.precision))
+(expect "the symbol is UNCHANGED" "PCO" free.pco.SYMBOL)
+(expect "total supply is UNCHANGED" 1000000.0 free.pco.TOTAL-SUPPLY)
+;; The consequence the auditor measured, asserted directly: a sub-0.01 amount
+;; must still be transferable. Under `precision: 2` this aborted with
+;; "precision violation" and every such balance was stranded for good.
+(begin-tx "F3: fine-grained amounts still move after the hostile upgrade")
+(env-sigs [{ "key": "carol-key", "caps": [(free.pco.TRANSFER "carol" "dave" 0.005)] }])
+(expect "a 0.005 transfer still succeeds" "Write succeeded"
+  (free.pco.transfer "carol" "dave" 0.005))
 (rollback-tx)
 
 (print "regressions.repl: all post-audit coverage gaps asserted")

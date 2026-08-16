@@ -94,7 +94,8 @@
 
 (begin-tx "governance: propose, vote, read the authoritative result")
 (env-keys ["throwaway"])
-(free.pco-dryrun.create-proposal "dry" "does the renamed pair govern?" ["a" "b"] 72)
+(free.pco-dryrun.create-proposal "1" "dry" "does the renamed pair govern?" ["a" "b"] (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-04T12:00:00Z"))
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })  ; past the announce window
 (env-sigs [ { "key": "1111111111111111111111111111111111111111111111111111111111111111"
             , "caps": [(free.pco-dryrun.VOTE "1"
                         "k:1111111111111111111111111111111111111111111111111111111111111111")] } ])
@@ -104,6 +105,7 @@
 (expect "the head-to-head result is readable" true
   (!= 0 (length (at 'pairs (free.pco-dryrun.get-head-to-head "1")))))
 (commit-tx)
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })  ; past the 12h announce window (the chain-local voting design C8)
 
 ;; the pool must still be refused, on the renamed pair
 (begin-tx "the pool cannot vote here either")

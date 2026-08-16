@@ -73,7 +73,7 @@
 (env-keys ["ledger-a"])
 (expect "ops solo runs claim ops" "claims open" (free.pco-claim.set-open true))
 (expect "ops solo authors a governance question" "1"
-  (free.pco.create-proposal "ops-tier reachable" "b" ["a" "b"] 72))
+  (free.pco.create-proposal "1" "ops-tier reachable" "b" ["a" "b"] (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-04T12:00:00Z")))
 (rollback-tx)
 
 (begin-tx "1-of-2: the OTHER device operates too, so one lost device never halts ops")
@@ -328,7 +328,7 @@
 ;; remaining budget to accounts ops controls, and the daily meter cannot bound
 ;; it because create-round charged that budget on an earlier day.
 ;; NOTE: a fresh transaction - the claim above installed a managed capability,
-;; which poisons every later keyset check in the same tx (platform trap).
+;; which poisons every later keyset check in the same tx (Pact managed-cap semantics).
 (begin-tx "code is frozen once a round has claims")
 (env-keys ["ledger-a"])
 (expect-failure "code is frozen once a round has claims"
@@ -459,14 +459,14 @@
 (commit-tx)
 
 ;; reopen in a SEPARATE tx: a grant's in-code install-capability poisons all
-;; later keyset enforcement in the same tx (see the autonomy regression below)
+;; later keyset enforcement in the same tx (see the autonomy note below)
 (begin-tx "reopen the master switch (own tx - one op per tx after a grant)")
 (env-keys ["ledger-a"])
 (free.pco-claim.set-open true)
 (commit-tx)
 
 ;; ---------------------------------------------------------------------------
-;; PLATFORM REGRESSION (REPL-verified 5.4): installing a managed capability
+;; MANAGED-CAP INSTALL SEMANTICS (REPL-verified 5.4): installing a managed capability
 ;; from code (grant's pco.TRANSFER install) makes EVERY later keyset
 ;; enforcement in the SAME tx fail - scoped and unscoped signatures alike.
 ;; Operational rule: one keyset-gated call per tx after any grant; batches

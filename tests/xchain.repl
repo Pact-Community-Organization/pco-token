@@ -142,7 +142,8 @@
 (env-data { "pco-gov": { "keys": ["ledger-a", "ledger-b", "ledger-c"], "pred": "keys-2" } })
 (env-keys ["ledger-a", "ledger-b"])
 (free.pco.set-ops-guard (read-keyset 'pco-gov))
-(free.pco.create-proposal "xc" "does weight leave with the tokens?" ["a" "b"] 72)
+(free.pco.create-proposal "1" "xc" "does weight leave with the tokens?" ["a" "b"] (time "2026-08-01T00:00:00Z") (time "2026-08-01T12:00:00Z") (time "2026-08-04T12:00:00Z"))
+(env-chain-data { "chain-id": "0", "block-time": (time "2026-08-01T12:00:01Z") })  ; past the announce window
 (env-sigs [ { "key": "whale-key", "caps": [(free.pco.VOTE "1" "whale")] } ])
 (free.pco.cast-vote "1" "whale" [0])
 (expect "the whole balance is voting" 1000000.0

@@ -24,6 +24,8 @@ gen () {  # $1 = source, $2 = target basename
       -e 's/\bpco-claim\.\([a-zA-Z-]\)/pco-claim-dryrun.\1/g' \
       -e 's/\bpco\.\([a-zA-Z-]\)/pco-dryrun.\1/g' \
       -e 's/{}\.pco-gov/{}.pco-dryrun-gov/g' \
+      -e 's/^  (defconst SYMBOL "PCO"$/  (defconst SYMBOL "PCODRY"/' \
+      -e 's/^  (defconst TOTAL-SUPPLY:decimal 1000000\.0$/  (defconst TOTAL-SUPPLY:decimal 100.0/' \
       "$1" > "$OUT/$2"
   # Prepend the throwaway notice INSIDE the existing @doc. Done in python, not
   # awk/sed: the doc is a Pact multi-line string literal held together by
@@ -67,5 +69,20 @@ if grep -nE '[^-]\bpco\.[a-zA-Z]' "$OUT"/*.pact; then
 fi
 if ! grep -q "THROWAWAY TEST DEPLOYMENT" "$OUT/pco-dryrun.pact"; then
   echo "FAIL: the throwaway notice is missing"; exit 1
+fi
+# Since cold-audit F3 the token's symbol and supply are LITERALS in pco.pact
+# rather than deploy parameters, so a data block can no longer restate them —
+# which also means the dry run can no longer ASK for its throwaway 100.0 supply.
+# It is substituted here instead. Assert it, because a silently-missed
+# substitution would make the dry run mint 1,000,000 real-shaped tokens and
+# measure something other than what it claims to.
+if ! grep -q '(defconst TOTAL-SUPPLY:decimal 100.0' "$OUT/pco-dryrun.pact"; then
+  echo "FAIL: the dry-run supply was not substituted (still the real 1000000.0?)"; exit 1
+fi
+if ! grep -q '(defconst SYMBOL "PCODRY"' "$OUT/pco-dryrun.pact"; then
+  echo "FAIL: the dry-run symbol was not substituted"; exit 1
+fi
+if grep -q '(defconst TOTAL-SUPPLY:decimal 1000000.0' "$OUT/pco-dryrun.pact"; then
+  echo "FAIL: the real supply survived into the dry-run contract"; exit 1
 fi
 echo "OK: renames complete, throwaway notice present"

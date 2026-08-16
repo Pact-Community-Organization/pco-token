@@ -8,7 +8,7 @@
 ;; THE PROPERTY: the PCO gas station must never be frozen, and the freeze must be
 ;; unshippable rather than merely discouraged.
 ;;
-;; ADR-PCO-014:56-58 already said it must never be frozen. Nothing enforced it:
+;; a recorded design decision:56-58 already said it must never be frozen. Nothing enforced it:
 ;; the flip was one word in a defconst, and a mutation audit confirmed that
 ;; deleting GOVERNANCE's `(enforce (not FROZEN-MODULE))` broke no test at all.
 ;;
