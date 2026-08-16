@@ -254,3 +254,39 @@ npx tsx src/local.ts '('$PCO_NS'.pco.non-voting? ('$PCO_NS'.pco-claim.pool-accou
 
 A fresh clone of `mainnet-v1` must generate its derived sources before the static gate runs, or
 it reports a VIOLATION that reads like a contract defect — see RUNBOOK §B item 2.
+
+---
+
+## 8. Deploy events since the original ceremony (append-only)
+
+This section is a ledger: entries are appended, never edited. Earlier sections describe the
+2026-07-31 deployment and remain true AS HISTORY — the hashes they record were the deployed
+hashes on that date. The current hashes are always the chain's answer, not this file's:
+
+    (at 'hash (describe-module "n_57fcd6f7b72e8949af51a8d6f17fe12cc7719d10.pco"))
+
+### 2026-08-15 — voting opened to all 20 chains
+
+Governance questions and ballots became chain-local: a holder votes on whichever chains hold
+their tokens, each chain tallies its own ballots, and the published result is the sum of all 20.
+Claims and awards remain on chain 0. Ranked-choice, admin authorship and the escrow vote bar are
+unchanged. Two-step upgrade (`pco`, then `pco-claim` so it re-links); the gas station was not
+redeployed — its deployed source references no `pco` module.
+
+| module | hash before | hash after |
+|---|---|---|
+| `pco` | `dhaabVg6xcckPSQjxeE_berIoILRcJb4XKOa6qeClLs` | `HLoNoMP7wFPM5TnWqWFZ7EXBqGpQw-hv_-ANl0jAAN0` |
+| `pco-claim` | `nlskDuK6PzL8YYQ3-EvgxBer72ePBXg1c90r8AqEWgM` | `0-o3sWatOKl-srYe2H3LYTg3-jF_vCjDdPAvEQcQAYc` |
+| `pco-gas-station` | `mOexAK7BRecYDLtkmVc-YZSxB1TxiLawvImoB08QWQc` | unchanged |
+
+The new `pco` blesses the prior hash, so in-flight cross-chain transfers started under it can
+always complete. No balance moved and no claim was interrupted; every figure is re-derivable
+from the chain. Verified uniform across all 20 chains after each step.
+
+### 2026-08-15 — documentation-only redeploy (all three modules)
+
+The stored source was replaced with a documentation-slimmed version of identical code. **All
+three module hashes are unchanged**, which is the on-chain proof the change was non-semantic —
+a Pact module hash covers the compiled definitions, so identical hashes entail identical
+behaviour. `describe-module` now returns the current source for each module, byte-identical to
+`contracts/` in this repository.
