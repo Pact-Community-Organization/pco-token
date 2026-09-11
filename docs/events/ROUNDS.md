@@ -54,6 +54,33 @@ is enough.
 Answerable two independent ways — from this repository's contracts, and from the deployed modules
 on chain. Either one is enough, and looking is the round.
 
+## Round 3 — `quest-3`
+
+| Field | Value |
+|---|---|
+| Round id | `quest-3` |
+| Theme | Pact defpacts — multi-step transactions |
+| Question | *Every running defpact — a multi-step Pact transaction, the kind that moves tokens between Kadena chains — has a unique identifier that any of its steps can read by calling one builtin function. What is that builtin called? (lowercase, hyphenated, exactly as you would write it in Pact — the name only, no parentheses)* |
+| Where to learn | https://kda-chain.org/docs/pact-5/general — the Pact 5 builtin reference |
+| Amount / budget | 100 PCO per claim, one claim per account, budget 2,500 PCO |
+| Window | opens 2026-08-28 20:00 UTC · closes 2026-09-11 12:00 UTC |
+
+Claim at https://pact-community.org/token — select **quest-3** in the round dropdown (the genesis
+round is still open until 31 August and appears alongside it).
+
+## Round 4 — `quest-4`
+
+| Field | Value |
+|---|---|
+| Round id | `quest-4` |
+| Theme | Pact capabilities — who may do what |
+| Question | *Capabilities are how Pact decides who may do what. Which builtin grants a capability for the duration of one block of code — and only that block? (lowercase, hyphenated, exactly as you would write it in Pact — the name only, no parentheses)* |
+| Where to learn | https://kda-chain.org/docs/smart-contracts/capabilities — the concept · https://kda-chain.org/docs/pact-5/capabilities — the builtin reference |
+| Amount / budget | 100 PCO per claim, one claim per account, budget 2,500 PCO |
+| Window | opens 2026-09-11 20:00 UTC · closes 2026-09-25 12:00 UTC |
+
+Claim at https://pact-community.org/token — select **quest-4** in the round dropdown.
+
 ## Governance reading-quests — `gov-YYYY-MM` (monthly)
 
 One per Governance Round. The code is a short phrase **embedded inside the proposal body
