@@ -81,6 +81,19 @@ round is still open until 31 August and appears alongside it).
 
 Claim at https://pact-community.org/token — select **quest-4** in the round dropdown.
 
+## Round 5 — `quest-5`
+
+| Field | Value |
+|---|---|
+| Round id | `quest-5` |
+| Theme | Accounts, guards and principals |
+| Question | *A Kadena account name can be a "principal": the name itself encodes the guard that controls it, and it begins with a short prefix such as `k:` or `r:`. One Pact builtin takes such an account name and returns which kind of guard that prefix stands for. What is that builtin called? (lowercase, hyphenated, exactly as you would write it in Pact — the name only, no parentheses)* |
+| Where to learn | https://kda-chain.org/docs/smart-contracts/accounts — accounts, keys and principals · https://kda-chain.org/docs/pact-5/guards — the guard builtins |
+| Amount / budget | 100 PCO per claim, one claim per account, budget 2,500 PCO |
+| Window | opens 2026-09-26 14:00 UTC · closes 2026-10-09 12:00 UTC |
+
+Claim at https://pact-community.org/token — select **quest-5** in the round dropdown.
+
 ## Governance reading-quests — `gov-YYYY-MM` (monthly)
 
 One per Governance Round. The code is a short phrase **embedded inside the proposal body
