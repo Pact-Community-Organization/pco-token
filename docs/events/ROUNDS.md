@@ -94,6 +94,19 @@ Claim at https://pact-community.org/token — select **quest-4** in the round dr
 
 Claim at https://pact-community.org/token — select **quest-5** in the round dropdown.
 
+## Round 6 — `quest-6`
+
+| Field | Value |
+|---|---|
+| Round id | `quest-6` |
+| Theme | Pact tables — reading a row that might not be there |
+| Question | *Reading a row that does not exist makes a Pact transaction fail. One builtin reads a row but falls back to values you supply when the key is missing — the usual way a contract treats "no row yet" as a zero balance. What is that builtin called? (lowercase, hyphenated, exactly as you would write it in Pact — the name only, no parentheses)* |
+| Where to learn | https://kda-chain.org/docs/smart-contracts/databases — how Pact stores data · https://kda-chain.org/docs/pact-5/database — the database builtins |
+| Amount / budget | 100 PCO per claim, one claim per account, budget 2,500 PCO |
+| Window | opens 2026-10-11 14:00 UTC · closes 2026-10-23 12:00 UTC |
+
+Claim at https://pact-community.org/token — select **quest-6** in the round dropdown.
+
 ## Governance reading-quests — `gov-YYYY-MM` (monthly)
 
 One per Governance Round. The code is a short phrase **embedded inside the proposal body
